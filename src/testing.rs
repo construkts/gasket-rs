@@ -1,4 +1,4 @@
-use super::InputPort;
+use crate::messaging::InputPort;
 
 pub fn compare_inbound_sequence<M, I>(input: &mut InputPort<M>, expected: I)
 where
