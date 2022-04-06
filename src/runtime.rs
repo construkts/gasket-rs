@@ -84,16 +84,16 @@ where
     }
 
     fn actuate(&mut self) -> StageEvent {
-        if self.anchor.dismissed.load() {
-            return StageEvent::Dismissed;
-        }
-
         match self.state {
             StageState::Bootstrap => {
+                if self.anchor.dismissed.load() {
+                    return StageEvent::Dismissed;
+                }
+
                 let result = retries::retry_operation(
                     || self.worker.bootstrap(),
                     &self.policy.bootstrap_retry,
-                    &self.anchor.dismissed,
+                    Some(&self.anchor.dismissed),
                 );
 
                 match result {
@@ -102,25 +102,38 @@ where
                 }
             }
             StageState::Working => {
+                if self.anchor.dismissed.load() {
+                    return StageEvent::Dismissed;
+                }
+
                 let result = retries::retry_operation(
                     || self.worker.work(),
                     &self.policy.work_retry,
-                    &self.anchor.dismissed,
+                    Some(&self.anchor.dismissed),
                 );
 
                 match result {
                     Ok(WorkOutcome::Partial) => StageEvent::WorkPartial,
                     Ok(WorkOutcome::Idle) => StageEvent::WorkIdle,
                     Ok(WorkOutcome::Done) => StageEvent::WorkDone,
-                    Err(_) => StageEvent::WorkError,
+                    Err(err) => {
+                        log::error!("error on work loop: {}", err);
+                        StageEvent::WorkError
+                    }
                 }
             }
-            StageState::StandBy => StageEvent::StandBy,
+            StageState::StandBy => {
+                if self.anchor.dismissed.load() {
+                    return StageEvent::Dismissed;
+                }
+
+                StageEvent::StandBy
+            }
             StageState::Teardown => {
                 let result = retries::retry_operation(
                     || self.worker.teardown(),
                     &self.policy.teardown_retry,
-                    &self.anchor.dismissed,
+                    Some(&self.anchor.dismissed),
                 );
 
                 match result {
