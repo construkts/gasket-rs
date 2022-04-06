@@ -16,6 +16,14 @@ pub struct OutputPort<T> {
     sender: Option<Sender<Message<T>>>,
 }
 
+impl<T> Clone for OutputPort<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
 impl<T> Default for OutputPort<T> {
     fn default() -> Self {
         Self {
