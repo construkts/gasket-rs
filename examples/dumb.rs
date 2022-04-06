@@ -51,7 +51,7 @@ impl Worker for Terminal {
 fn main() {
     let mut ticker = Ticker {
         output: Default::default(),
-        value_1: Counter::new(),
+        value_1: Counter::default(),
         next_delay: 0,
     };
 
