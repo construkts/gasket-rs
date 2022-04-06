@@ -32,11 +32,19 @@ fn compute_backoff_delay(policy: &Policy, retry: u32) -> Duration {
     core::cmp::min(backoff, policy.max_backoff)
 }
 
-pub fn sleep_except_cancel(duration: Duration, cancel: &AtomicCell<bool>) {
+#[inline]
+fn should_cancel(flag: Option<&AtomicCell<bool>>) -> bool {
+    match flag {
+        Some(cancel) => cancel.load(),
+        None => false,
+    }
+}
+
+pub fn sleep_except_cancel(duration: Duration, cancel: Option<&AtomicCell<bool>>) {
     let start = Instant::now();
     let snoozer = Backoff::new();
 
-    while !cancel.load() && start.elapsed() <= duration {
+    while !should_cancel(cancel) && start.elapsed() <= duration {
         snoozer.snooze();
     }
 }
@@ -44,12 +52,12 @@ pub fn sleep_except_cancel(duration: Duration, cancel: &AtomicCell<bool>) {
 pub fn retry_operation<T>(
     mut op: impl FnMut() -> Result<T, Error>,
     policy: &Policy,
-    cancel: &AtomicCell<bool>,
+    cancel: Option<&AtomicCell<bool>>,
 ) -> Result<T, Error> {
     let mut retry = 0;
 
     loop {
-        if cancel.load() {
+        if should_cancel(cancel) {
             break Err(Error::Cancelled);
         }
 
@@ -104,7 +112,7 @@ mod tests {
             max_backoff: Duration::from_secs(100),
         };
 
-        assert!(retry_operation(op, &policy, &cancel).is_err());
+        assert!(retry_operation(op, &policy, Some(&cancel)).is_err());
 
         assert_eq!(*counter.borrow(), 4);
     }
@@ -124,7 +132,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let cancel = AtomicCell::new(false);
-        let result = retry_operation(op, &policy, &cancel);
+        let result = retry_operation(op, &policy, Some(&cancel));
         let elapsed = start.elapsed();
 
         assert!(result.is_err());
@@ -156,7 +164,7 @@ mod tests {
             cancel2.store(true);
         });
 
-        let result = retry_operation(op, &policy, &cancel);
+        let result = retry_operation(op, &policy, Some(&cancel));
         let elapsed = start.elapsed();
 
         assert!(result.is_err());
