@@ -1,4 +1,5 @@
 use std::{
+    ops::{Deref, DerefMut},
     sync::{Arc, Weak},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -32,6 +33,24 @@ pub trait Worker: Send {
 
     fn teardown(&mut self) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+impl Worker for Box<dyn Worker> {
+    fn metrics(&self) -> metrics::Registry {
+        self.deref().metrics()
+    }
+
+    fn work(&mut self) -> WorkResult {
+        self.deref_mut().work()
+    }
+
+    fn bootstrap(&mut self) -> Result<(), Error> {
+        self.deref_mut().bootstrap()
+    }
+
+    fn teardown(&mut self) -> Result<(), Error> {
+        self.deref_mut().teardown()
     }
 }
 
@@ -98,7 +117,10 @@ where
 
                 match result {
                     Ok(()) => StageEvent::BootstrapOk,
-                    Err(_) => StageEvent::BootstrapError,
+                    Err(err) => {
+                        log::error!("error bootstrapping stage: {}", err);
+                        StageEvent::BootstrapError
+                    }
                 }
             }
             StageState::Working => {
@@ -295,6 +317,17 @@ pub struct Policy {
     pub bootstrap_retry: retries::Policy,
     pub work_retry: retries::Policy,
     pub teardown_retry: retries::Policy,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            tick_timeout: None,
+            bootstrap_retry: retries::Policy::no_retry(),
+            work_retry: retries::Policy::no_retry(),
+            teardown_retry: retries::Policy::no_retry(),
+        }
+    }
 }
 
 pub fn spawn_stage<W>(worker: W, policy: Policy) -> Tether
