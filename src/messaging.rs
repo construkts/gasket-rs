@@ -12,6 +12,21 @@ impl<T> From<T> for Message<T> {
     }
 }
 
+impl<T> Clone for Message<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+pub trait SendPort<T> {
+    fn connect(&mut self, sender: Sender<Message<T>>);
+}
+
 pub struct OutputPort<T> {
     sender: Option<Sender<Message<T>>>,
 }
@@ -39,10 +54,60 @@ impl<T> OutputPort<T> {
             None => Err(Error::NotConnected),
         }
     }
+}
 
+impl<T> SendPort<T> for OutputPort<T> {
     fn connect(&mut self, sender: Sender<Message<T>>) {
         self.sender = Some(sender);
     }
+}
+
+pub struct FanoutPort<T>
+where
+    T: Clone,
+{
+    senders: Vec<Sender<Message<T>>>,
+}
+
+impl<T> FanoutPort<T>
+where
+    T: Clone,
+{
+    pub fn send(&mut self, msg: Message<T>) -> Result<(), Error> {
+        if self.senders.is_empty() {
+            return Err(Error::NotConnected);
+        }
+
+        for sender in self.senders.iter_mut() {
+            sender.send(msg.clone()).map_err(|_| Error::SendError)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<T> SendPort<T> for FanoutPort<T>
+where
+    T: Clone,
+{
+    fn connect(&mut self, sender: Sender<Message<T>>) {
+        self.senders.push(sender);
+    }
+}
+
+impl<T> Default for FanoutPort<T>
+where
+    T: Clone,
+{
+    fn default() -> Self {
+        Self {
+            senders: Vec::new(),
+        }
+    }
+}
+
+pub trait RecvPort<T> {
+    fn connect(&mut self, receiver: Receiver<Message<T>>);
 }
 
 pub struct InputPort<T> {
@@ -72,13 +137,60 @@ impl<T> InputPort<T> {
             None => Err(Error::NotConnected),
         }
     }
+}
 
+impl<T> RecvPort<T> for InputPort<T> {
     fn connect(&mut self, receiver: Receiver<Message<T>>) {
         self.receiver = Some(receiver);
     }
 }
 
-pub fn connect_ports<T>(output: &mut OutputPort<T>, input: &mut InputPort<T>, cap: usize) {
+pub struct FunnelPort<T> {
+    receivers: Vec<Receiver<Message<T>>>,
+}
+
+impl<T> FunnelPort<T> {
+    pub fn recv(&mut self) -> Result<Message<T>, Error> {
+        let mut select = crossbeam::channel::Select::new();
+
+        for recv in self.receivers.iter() {
+            select.recv(recv);
+        }
+
+        loop {
+            // Wait until a receive operation becomes ready and try executing it.
+            let index = select.ready();
+
+            let res = self.receivers[index].try_recv();
+
+            // If the operation turns out not to be ready, retry.
+            if let Err(e) = res {
+                if e.is_empty() {
+                    continue;
+                }
+            }
+
+            // Success!
+            return res.map_err(|_| Error::RecvError);
+        }
+    }
+}
+
+impl<T> RecvPort<T> for FunnelPort<T> {
+    fn connect(&mut self, receiver: Receiver<Message<T>>) {
+        self.receivers.push(receiver);
+    }
+}
+
+impl<T> Default for FunnelPort<T> {
+    fn default() -> Self {
+        Self {
+            receivers: Vec::new(),
+        }
+    }
+}
+
+pub fn connect_ports<T>(output: &mut impl SendPort<T>, input: &mut impl RecvPort<T>, cap: usize) {
     let (sender, receiver) = crossbeam::channel::bounded(cap);
     output.connect(sender);
     input.connect(receiver);
