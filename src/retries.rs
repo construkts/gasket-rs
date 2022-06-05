@@ -64,9 +64,8 @@ pub fn retry_operation<T>(
         let result = op();
 
         match result {
-            Ok(x) => break Ok(x),
-            Err(err) if retry < policy.max_retries => {
-                log::warn!("retryable operation error: {:?}", err);
+            Err(Error::RetryableError(msg)) if retry < policy.max_retries => {
+                log::warn!("retryable operation error: {:?}", msg);
 
                 retry += 1;
 
@@ -80,10 +79,11 @@ pub fn retry_operation<T>(
 
                 sleep_except_cancel(backoff, cancel);
             }
-            Err(x) => {
+            Err(Error::RetryableError(msg)) => {
                 log::error!("max retries reached, failing whole operation");
-                break Err(x);
+                break Err(Error::RetryableError(msg));
             }
+            x => break x,
         }
     }
 }
@@ -102,7 +102,7 @@ mod tests {
         let inner_counter = counter.clone();
         let op = move || -> Result<(), Error> {
             *inner_counter.borrow_mut() += 1;
-            Err(Error::WorkError("very bad stuff happened".to_string()))
+            Err(Error::RetryableError("very bad stuff happened".to_string()))
         };
 
         let policy = Policy {
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn honors_exponential_backoff() {
         let op = move || -> Result<(), Error> {
-            Err(Error::WorkError("very bad stuff happened".to_string()))
+            Err(Error::RetryableError("very bad stuff happened".to_string()))
         };
 
         let policy = Policy {
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn honors_cancel() {
         let op = move || -> Result<(), Error> {
-            Err(Error::WorkError("very bad stuff happened".to_string()))
+            Err(Error::RetryableError("very bad stuff happened".to_string()))
         };
 
         let policy = Policy {
