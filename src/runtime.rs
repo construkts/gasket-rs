@@ -58,6 +58,7 @@ impl Worker for Box<dyn Worker> {
 pub enum StageState {
     Bootstrap,
     Working,
+    Idle,
     StandBy,
     Teardown,
 }
@@ -67,7 +68,7 @@ pub enum StageEvent {
     WorkPartial,
     WorkIdle,
     WorkDone,
-    WorkError,
+    WorkError(Error),
     BootstrapOk,
     BootstrapError,
     TeardownOk,
@@ -123,7 +124,7 @@ where
                     }
                 }
             }
-            StageState::Working => {
+            StageState::Idle | StageState::Working => {
                 if self.anchor.dismissed.load() {
                     return StageEvent::Dismissed;
                 }
@@ -139,8 +140,8 @@ where
                     Ok(WorkOutcome::Idle) => StageEvent::WorkIdle,
                     Ok(WorkOutcome::Done) => StageEvent::WorkDone,
                     Err(err) => {
-                        log::error!("error on work loop: {}", err);
-                        StageEvent::WorkError
+                        log::error!("{}", err);
+                        StageEvent::WorkError(err)
                     }
                 }
             }
@@ -166,55 +167,49 @@ where
         }
     }
 
-    fn report(&self) {
-        self.anchor.last_state.store(self.state);
+    fn report(&self, event: &StageEvent, next_state: StageState) {
+        self.anchor.last_state.store(next_state);
         self.anchor.last_tick.store(Instant::now());
+
+        match event {
+            StageEvent::WorkPartial => {
+                self.tick_count.inc(1);
+            }
+            StageEvent::WorkIdle => {
+                self.idle_count.inc(1);
+            }
+            _ => (),
+        }
     }
 
-    fn fulfill(&mut self) {
-        let backoff = Backoff::new();
+    fn apply(&mut self, event: &StageEvent) -> Option<StageState> {
+        match event {
+            StageEvent::Dismissed => Some(StageState::Teardown),
+            StageEvent::WorkPartial => Some(StageState::Working),
+            StageEvent::WorkIdle => Some(StageState::Idle),
+            StageEvent::WorkDone => Some(StageState::StandBy),
+            StageEvent::WorkError(Error::ShouldRestart(_)) => Some(StageState::Bootstrap),
+            StageEvent::WorkError(Error::DismissableError(_)) => Some(StageState::Working),
+            StageEvent::WorkError(_) => Some(StageState::StandBy),
+            StageEvent::BootstrapOk => Some(StageState::Working),
+            StageEvent::BootstrapError => Some(StageState::StandBy),
+            StageEvent::StandBy => Some(StageState::StandBy),
+            StageEvent::TeardownOk => None,
+            StageEvent::TeardownError => None,
+        }
+    }
 
-        loop {
-            let event = self.actuate();
+    fn transition(&mut self) -> Option<StageState> {
+        let event = self.actuate();
+        let next = self.apply(&event);
 
-            match event {
-                StageEvent::Dismissed => {
-                    self.state = StageState::Teardown;
-                }
-                StageEvent::WorkPartial => {
-                    self.tick_count.inc(1);
-                    self.state = StageState::Working;
-                }
-                StageEvent::WorkIdle => {
-                    self.idle_count.inc(1);
-                    backoff.snooze();
-                    self.state = StageState::Working;
-                }
-                StageEvent::WorkDone => {
-                    self.state = StageState::StandBy;
-                }
-                StageEvent::WorkError => {
-                    self.state = StageState::StandBy;
-                }
-                StageEvent::BootstrapOk => {
-                    self.state = StageState::Working;
-                }
-                StageEvent::BootstrapError => {
-                    self.state = StageState::StandBy;
-                }
-                StageEvent::StandBy => {
-                    backoff.snooze();
-                    self.state = StageState::StandBy;
-                }
-                StageEvent::TeardownOk => {
-                    break;
-                }
-                StageEvent::TeardownError => {
-                    break;
-                }
+        match next {
+            Some(next_state) => {
+                self.report(&event, next_state);
+                self.state = next_state;
+                Some(next_state)
             }
-
-            self.report();
+            None => None,
         }
     }
 }
@@ -330,6 +325,22 @@ impl Default for Policy {
     }
 }
 
+fn fullfil_stage<W>(mut machine: StageMachine<W>)
+where
+    W: Worker,
+{
+    let backoff = Backoff::new();
+
+    while let Some(state) = machine.transition() {
+        match state {
+            StageState::Idle | StageState::StandBy => {
+                backoff.snooze();
+            }
+            _ => (),
+        }
+    }
+}
+
 pub fn spawn_stage<W>(worker: W, policy: Policy) -> Tether
 where
     W: Worker + 'static,
@@ -340,8 +351,8 @@ where
 
     let policy2 = policy.clone();
     let thread_handle = std::thread::spawn(move || {
-        let mut machine = StageMachine::new(anchor, worker, policy2);
-        machine.fulfill();
+        let machine = StageMachine::new(anchor, worker, policy2);
+        fullfil_stage(machine);
     });
 
     Tether {

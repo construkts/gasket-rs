@@ -16,8 +16,17 @@ pub enum Error {
     #[error("error receiving work unit through input port")]
     RecvError,
 
-    #[error("error while performing stage work: {0}")]
-    WorkError(String),
+    #[error("stage panic, stopping all work: {0}")]
+    WorkPanic(String),
+
+    #[error("error that requires stage to restart: {0}")]
+    ShouldRestart(String),
+
+    #[error("retryable work error, will attempt again: {0}")]
+    RetryableError(String),
+
+    #[error("dismissable work error, will continue: {0}")]
+    DismissableError(String),
 
     #[error("can't perform action since tether to stage was dropped")]
     TetherDropped,
@@ -34,7 +43,7 @@ where
     fn or_work_err(self) -> Result<T, Error> {
         match self {
             Ok(x) => Ok(x),
-            Err(x) => Err(Error::WorkError(format!("{}", x))),
+            Err(x) => Err(Error::WorkPanic(format!("{}", x))),
         }
     }
 }
