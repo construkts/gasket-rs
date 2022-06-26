@@ -16,6 +16,9 @@ pub enum Error {
     #[error("error receiving work unit through input port")]
     RecvError,
 
+    #[error("input port is idle")]
+    RecvIdle,
+
     #[error("stage panic, stopping all work: {0}")]
     WorkPanic(String),
 
@@ -33,17 +36,41 @@ pub enum Error {
 }
 
 pub trait AsWorkError<T> {
-    fn or_work_err(self) -> Result<T, Error>;
+    fn or_panic(self) -> Result<T, Error>;
+    fn or_dismiss(self) -> Result<T, Error>;
+    fn or_retry(self) -> Result<T, Error>;
+    fn or_restart(self) -> Result<T, Error>;
 }
 
 impl<T, E> AsWorkError<T> for Result<T, E>
 where
     E: Display,
 {
-    fn or_work_err(self) -> Result<T, Error> {
+    fn or_panic(self) -> Result<T, Error> {
         match self {
             Ok(x) => Ok(x),
             Err(x) => Err(Error::WorkPanic(format!("{}", x))),
+        }
+    }
+
+    fn or_dismiss(self) -> Result<T, Error> {
+        match self {
+            Ok(x) => Ok(x),
+            Err(x) => Err(Error::DismissableError(format!("{}", x))),
+        }
+    }
+
+    fn or_retry(self) -> Result<T, Error> {
+        match self {
+            Ok(x) => Ok(x),
+            Err(x) => Err(Error::RetryableError(format!("{}", x))),
+        }
+    }
+
+    fn or_restart(self) -> Result<T, Error> {
+        match self {
+            Ok(x) => Ok(x),
+            Err(x) => Err(Error::ShouldRestart(format!("{}", x))),
         }
     }
 }
