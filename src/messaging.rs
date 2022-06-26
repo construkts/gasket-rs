@@ -1,4 +1,6 @@
-use crossbeam::channel::{Receiver, Sender};
+use std::time::Duration;
+
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::error::Error;
 
@@ -124,6 +126,11 @@ impl<T> Default for InputPort<T> {
     }
 }
 
+// TODO: there should a notion of what's the expected throughput for each port,
+// it could be a value set at the port level. This could give us a way to
+// calculate a more accurate timeout instead of relying on a magic number.
+const IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
+
 impl<T> InputPort<T> {
     pub fn recv(&mut self) -> Result<Message<T>, Error> {
         match &self.receiver {
@@ -132,6 +139,20 @@ impl<T> InputPort<T> {
                     self.counter += 1;
                     Ok(unit)
                 }
+                Err(_) => Err(Error::RecvError),
+            },
+            None => Err(Error::NotConnected),
+        }
+    }
+
+    pub fn recv_or_idle(&mut self) -> Result<Message<T>, Error> {
+        match &self.receiver {
+            Some(receiver) => match receiver.recv_timeout(IDLE_TIMEOUT) {
+                Ok(unit) => {
+                    self.counter += 1;
+                    Ok(unit)
+                }
+                Err(RecvTimeoutError::Timeout) => Err(Error::RecvIdle),
                 Err(_) => Err(Error::RecvError),
             },
             None => Err(Error::NotConnected),

@@ -190,6 +190,7 @@ where
             StageEvent::WorkDone => Some(StageState::StandBy),
             StageEvent::WorkError(Error::ShouldRestart(_)) => Some(StageState::Bootstrap),
             StageEvent::WorkError(Error::DismissableError(_)) => Some(StageState::Working),
+            StageEvent::WorkError(Error::RecvIdle) => Some(StageState::Idle),
             StageEvent::WorkError(_) => Some(StageState::StandBy),
             StageEvent::BootstrapOk => Some(StageState::Working),
             StageEvent::BootstrapError => Some(StageState::StandBy),
@@ -239,7 +240,7 @@ pub struct Tether {
     policy: Policy,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum TetherState {
     Dropped,
     Blocked(StageState),
