@@ -70,7 +70,7 @@ pub enum StageEvent {
     WorkDone,
     WorkError(Error),
     BootstrapOk,
-    BootstrapError,
+    BootstrapError(Error),
     TeardownOk,
     TeardownError,
     StandBy,
@@ -83,20 +83,36 @@ where
     state: StageState,
     anchor: Arc<Anchor>,
     policy: Policy,
+    name: String,
     tick_count: metrics::Counter,
     idle_count: metrics::Counter,
     worker: W,
+}
+
+#[inline]
+fn log_stage_error(stage: &str, phase: &str, x: &Error) {
+    match x {
+        Error::RecvIdle => log::debug!("STAGE: {}, PHASE: {}, PORT IDLE", stage, phase),
+        Error::ShouldRestart(x) => log::warn!("STAGE: {}, {}, RESTART: {}", stage, phase, x),
+        Error::RetryableError(x) => log::warn!("STAGE: {}, {}, MAX RETRIES: {}", stage, phase, x),
+        Error::WorkPanic(x) => log::error!("STAGE: {}, {}, PANIC: {}", stage, phase, x),
+        Error::RecvError => log::error!("STAGE: {}, {}, RECV ERR: {}", stage, phase, x),
+        Error::SendError => log::error!("STAGE: {}, {}, SEND ERR: {}", stage, phase, x),
+        Error::NotConnected => log::error!("STAGE: {}, {}, NOT CONNECTED: {}", stage, phase, x),
+        x => log::error!("STAGE: {}, {}, {:?}", stage, phase, x),
+    };
 }
 
 impl<W> StageMachine<W>
 where
     W: Worker,
 {
-    fn new(anchor: Arc<Anchor>, worker: W, policy: Policy) -> Self {
+    fn new(anchor: Arc<Anchor>, worker: W, policy: Policy, name: String) -> Self {
         StageMachine {
             state: StageState::Bootstrap,
             tick_count: Default::default(),
             idle_count: Default::default(),
+            name,
             anchor,
             policy,
             worker,
@@ -118,10 +134,7 @@ where
 
                 match result {
                     Ok(()) => StageEvent::BootstrapOk,
-                    Err(err) => {
-                        log::error!("error bootstrapping stage: {}", err);
-                        StageEvent::BootstrapError
-                    }
+                    Err(err) => StageEvent::BootstrapError(err),
                 }
             }
             StageState::Idle | StageState::Working => {
@@ -139,10 +152,7 @@ where
                     Ok(WorkOutcome::Partial) => StageEvent::WorkPartial,
                     Ok(WorkOutcome::Idle) => StageEvent::WorkIdle,
                     Ok(WorkOutcome::Done) => StageEvent::WorkDone,
-                    Err(err) => {
-                        log::error!("{}", err);
-                        StageEvent::WorkError(err)
-                    }
+                    Err(err) => StageEvent::WorkError(err),
                 }
             }
             StageState::StandBy => {
@@ -178,6 +188,8 @@ where
             StageEvent::WorkIdle => {
                 self.idle_count.inc(1);
             }
+            StageEvent::BootstrapError(x) => log_stage_error(&self.name, "BOOTSTRAP", x),
+            StageEvent::WorkError(x) => log_stage_error(&self.name, "WORK", x),
             _ => (),
         }
     }
@@ -193,7 +205,7 @@ where
             StageEvent::WorkError(Error::RecvIdle) => Some(StageState::Idle),
             StageEvent::WorkError(_) => Some(StageState::StandBy),
             StageEvent::BootstrapOk => Some(StageState::Working),
-            StageEvent::BootstrapError => Some(StageState::StandBy),
+            StageEvent::BootstrapError(_) => Some(StageState::StandBy),
             StageEvent::StandBy => Some(StageState::StandBy),
             StageEvent::TeardownOk => None,
             StageEvent::TeardownError => None,
@@ -235,6 +247,7 @@ impl Anchor {
 }
 
 pub struct Tether {
+    name: String,
     anchor_ref: Weak<Anchor>,
     thread_handle: JoinHandle<()>,
     policy: Policy,
@@ -248,6 +261,10 @@ pub enum TetherState {
 }
 
 impl Tether {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn join_stage(self) {
         self.thread_handle
             .join()
@@ -342,21 +359,26 @@ where
     }
 }
 
-pub fn spawn_stage<W>(worker: W, policy: Policy) -> Tether
+pub fn spawn_stage<W>(worker: W, policy: Policy, name: Option<&str>) -> Tether
 where
     W: Worker + 'static,
 {
+    let name = name
+        .map(|x| x.to_owned())
+        .unwrap_or("un-named stage".into());
     let metrics = worker.metrics();
     let anchor = Arc::new(Anchor::new(metrics));
     let anchor_ref = Arc::downgrade(&anchor);
 
+    let name2 = name.clone();
     let policy2 = policy.clone();
     let thread_handle = std::thread::spawn(move || {
-        let machine = StageMachine::new(anchor, worker, policy2);
+        let machine = StageMachine::new(anchor, worker, policy2, name2);
         fullfil_stage(machine);
     });
 
     Tether {
+        name,
         anchor_ref,
         thread_handle,
         policy,
