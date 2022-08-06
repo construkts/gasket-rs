@@ -80,7 +80,7 @@ pub fn retry_operation<T>(
                 sleep_except_cancel(backoff, cancel);
             }
             Err(Error::RetryableError(msg)) => {
-                log::error!("max retries reached, failing whole operation");
+                log::debug!("max retries reached");
                 break Err(Error::RetryableError(msg));
             }
             x => break x,
