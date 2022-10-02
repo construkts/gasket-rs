@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use gasket::{
-    messaging::{connect_ports, InputPort, OutputPort},
+    messaging::{connect_ports, InputPort, OutputPort, TwoPhaseInputPort},
     metrics::{self, Counter, Registry},
     retries,
     runtime::{spawn_stage, Policy, WorkOutcome, WorkResult, Worker},
@@ -32,7 +32,7 @@ impl Worker for Ticker {
 }
 
 struct Terminal {
-    input: InputPort<Instant>,
+    input: TwoPhaseInputPort<Instant>,
 }
 
 impl Worker for Terminal {
@@ -44,6 +44,7 @@ impl Worker for Terminal {
         let unit = self.input.recv()?;
         println!("{:?}", unit.payload);
 
+        self.input.commit();
         Ok(WorkOutcome::Partial)
     }
 }
@@ -69,6 +70,7 @@ fn main() {
             work_retry: retries::Policy::no_retry(),
             teardown_retry: retries::Policy::no_retry(),
         },
+        Some("ticker"),
     );
 
     let tether2 = spawn_stage(
@@ -79,6 +81,7 @@ fn main() {
             work_retry: retries::Policy::no_retry(),
             teardown_retry: retries::Policy::no_retry(),
         },
+        Some("terminal"),
     );
 
     let tethers = vec![tether1, tether2];
