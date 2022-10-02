@@ -166,6 +166,55 @@ impl<T> RecvPort<T> for InputPort<T> {
     }
 }
 
+pub struct TwoPhaseInputPort<T> {
+    inner: InputPort<T>,
+    staging: Option<Message<T>>,
+}
+
+impl<T> TwoPhaseInputPort<T>
+where
+    T: Clone,
+{
+    pub fn recv(&mut self) -> Result<Message<T>, Error> {
+        if self.staging.is_none() {
+            let x = self.inner.recv()?;
+            self.staging = Some(x);
+        }
+
+        let x = self.staging.as_ref().unwrap();
+        Ok(x.clone())
+    }
+
+    pub fn recv_or_idle(&mut self) -> Result<Message<T>, Error> {
+        if self.staging.is_none() {
+            let x = self.inner.recv()?;
+            self.staging = Some(x);
+        }
+
+        let x = self.staging.as_ref().unwrap();
+        Ok(x.clone())
+    }
+
+    pub fn commit(&mut self) {
+        self.staging = None;
+    }
+}
+
+impl<T> RecvPort<T> for TwoPhaseInputPort<T> {
+    fn connect(&mut self, receiver: Receiver<Message<T>>) {
+        self.inner.connect(receiver);
+    }
+}
+
+impl<T> Default for TwoPhaseInputPort<T> {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            staging: Default::default(),
+        }
+    }
+}
+
 pub struct FunnelPort<T> {
     receivers: Vec<Receiver<Message<T>>>,
 }
