@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use thiserror::Error;
+use tracing::{error, warn};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -19,17 +20,17 @@ pub enum Error {
     #[error("input port is idle")]
     RecvIdle,
 
-    #[error("stage panic, stopping all work: {0}")]
-    WorkPanic(String),
+    #[error("stage panic, stopping all work")]
+    WorkPanic,
 
-    #[error("error that requires stage to restart: {0}")]
-    ShouldRestart(String),
+    #[error("error that requires stage to restart")]
+    ShouldRestart,
 
-    #[error("retryable work error, will attempt again: {0}")]
-    RetryableError(String),
+    #[error("retryable work error, will attempt again")]
+    RetryableError,
 
-    #[error("dismissable work error, will continue: {0}")]
-    DismissableError(String),
+    #[error("dismissable work error, will continue")]
+    DismissableError,
 
     #[error("can't perform action since tether to stage was dropped")]
     TetherDropped,
@@ -49,28 +50,40 @@ where
     fn or_panic(self) -> Result<T, Error> {
         match self {
             Ok(x) => Ok(x),
-            Err(x) => Err(Error::WorkPanic(format!("{}", x))),
+            Err(x) => {
+                error!(%x);
+                Err(Error::WorkPanic)
+            }
         }
     }
 
     fn or_dismiss(self) -> Result<T, Error> {
         match self {
             Ok(x) => Ok(x),
-            Err(x) => Err(Error::DismissableError(format!("{}", x))),
+            Err(x) => {
+                warn!(%x);
+                Err(Error::DismissableError)
+            }
         }
     }
 
     fn or_retry(self) -> Result<T, Error> {
         match self {
             Ok(x) => Ok(x),
-            Err(x) => Err(Error::RetryableError(format!("{}", x))),
+            Err(x) => {
+                warn!(%x);
+                Err(Error::RetryableError)
+            }
         }
     }
 
     fn or_restart(self) -> Result<T, Error> {
         match self {
             Ok(x) => Ok(x),
-            Err(x) => Err(Error::ShouldRestart(format!("{}", x))),
+            Err(x) => {
+                warn!(%x);
+                Err(Error::ShouldRestart)
+            }
         }
     }
 }

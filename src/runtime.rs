@@ -6,6 +6,7 @@ use std::{
 };
 
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
+use tracing::{debug, error, info, instrument, trace, warn, Level};
 
 use crate::metrics::{collect_readings, Readings};
 use crate::retries;
@@ -28,10 +29,12 @@ pub trait Worker: Send {
     fn work(&mut self) -> WorkResult;
 
     fn bootstrap(&mut self) -> Result<(), Error> {
+        info!("noop bootstrap complete");
         Ok(())
     }
 
     fn teardown(&mut self) -> Result<(), Error> {
+        info!("noop teardown complete");
         Ok(())
     }
 }
@@ -63,6 +66,7 @@ pub enum StageState {
     Teardown,
 }
 
+#[derive(Debug)]
 pub enum StageEvent {
     Dismissed,
     WorkPartial,
@@ -90,16 +94,16 @@ where
 }
 
 #[inline]
-fn log_stage_error(stage: &str, phase: &str, x: &Error) {
+fn log_stage_error(x: &Error) {
     match x {
-        Error::RecvIdle => log::debug!("STAGE: {}, PHASE: {}, PORT IDLE", stage, phase),
-        Error::ShouldRestart(x) => log::warn!("STAGE: {}, {}, RESTART: {}", stage, phase, x),
-        Error::RetryableError(x) => log::warn!("STAGE: {}, {}, MAX RETRIES: {}", stage, phase, x),
-        Error::WorkPanic(x) => log::error!("STAGE: {}, {}, PANIC: {}", stage, phase, x),
-        Error::RecvError => log::error!("STAGE: {}, {}, RECV ERR: {}", stage, phase, x),
-        Error::SendError => log::error!("STAGE: {}, {}, SEND ERR: {}", stage, phase, x),
-        Error::NotConnected => log::error!("STAGE: {}, {}, NOT CONNECTED: {}", stage, phase, x),
-        x => log::error!("STAGE: {}, {}, {:?}", stage, phase, x),
+        Error::RecvIdle => debug!("input port idle"),
+        Error::ShouldRestart => warn!("stage should restart"),
+        Error::RetryableError => warn!("work should be retried"),
+        Error::WorkPanic => error!("work panic"),
+        Error::RecvError => error!("stage error while receiving message"),
+        Error::SendError => error!("stage error while sending message"),
+        Error::NotConnected => error!("stage not connected",),
+        x => error!("stage error {}", x),
     };
 }
 
@@ -119,61 +123,62 @@ where
         }
     }
 
+    #[instrument(level = Level::INFO, skip_all)]
+    fn bootstrap(&mut self) -> StageEvent {
+        let result = retries::retry_operation(
+            || self.worker.bootstrap(),
+            &self.policy.bootstrap_retry,
+            Some(&self.anchor.dismissed),
+        );
+
+        match result {
+            Ok(()) => StageEvent::BootstrapOk,
+            Err(err) => StageEvent::BootstrapError(err),
+        }
+    }
+
+    #[instrument(level = Level::INFO, skip_all)]
+    fn work(&mut self) -> StageEvent {
+        let result = retries::retry_operation(
+            || self.worker.work(),
+            &self.policy.work_retry,
+            Some(&self.anchor.dismissed),
+        );
+
+        match result {
+            Ok(WorkOutcome::Partial) => StageEvent::WorkPartial,
+            Ok(WorkOutcome::Idle) => StageEvent::WorkIdle,
+            Ok(WorkOutcome::Done) => StageEvent::WorkDone,
+            Err(err) => StageEvent::WorkError(err),
+        }
+    }
+
+    #[instrument(level = Level::INFO, skip_all)]
+    fn teardown(&mut self) -> StageEvent {
+        let result = retries::retry_operation(
+            || self.worker.teardown(),
+            &self.policy.teardown_retry,
+            Some(&self.anchor.dismissed),
+        );
+
+        match result {
+            Ok(_) => StageEvent::TeardownOk,
+            Err(_) => StageEvent::TeardownError,
+        }
+    }
+
     fn actuate(&mut self) -> StageEvent {
+        // if stage is dismissed, return early
+        let is_dismissed = self.anchor.dismissed.load();
+        if self.state != StageState::Teardown && is_dismissed {
+            return StageEvent::Dismissed;
+        }
+
         match self.state {
-            StageState::Bootstrap => {
-                if self.anchor.dismissed.load() {
-                    return StageEvent::Dismissed;
-                }
-
-                let result = retries::retry_operation(
-                    || self.worker.bootstrap(),
-                    &self.policy.bootstrap_retry,
-                    Some(&self.anchor.dismissed),
-                );
-
-                match result {
-                    Ok(()) => StageEvent::BootstrapOk,
-                    Err(err) => StageEvent::BootstrapError(err),
-                }
-            }
-            StageState::Idle | StageState::Working => {
-                if self.anchor.dismissed.load() {
-                    return StageEvent::Dismissed;
-                }
-
-                let result = retries::retry_operation(
-                    || self.worker.work(),
-                    &self.policy.work_retry,
-                    Some(&self.anchor.dismissed),
-                );
-
-                match result {
-                    Ok(WorkOutcome::Partial) => StageEvent::WorkPartial,
-                    Ok(WorkOutcome::Idle) => StageEvent::WorkIdle,
-                    Ok(WorkOutcome::Done) => StageEvent::WorkDone,
-                    Err(err) => StageEvent::WorkError(err),
-                }
-            }
-            StageState::StandBy => {
-                if self.anchor.dismissed.load() {
-                    return StageEvent::Dismissed;
-                }
-
-                StageEvent::StandBy
-            }
-            StageState::Teardown => {
-                let result = retries::retry_operation(
-                    || self.worker.teardown(),
-                    &self.policy.teardown_retry,
-                    Some(&self.anchor.dismissed),
-                );
-
-                match result {
-                    Ok(_) => StageEvent::TeardownOk,
-                    Err(_) => StageEvent::TeardownError,
-                }
-            }
+            StageState::Bootstrap => self.bootstrap(),
+            StageState::Idle | StageState::Working => self.work(),
+            StageState::StandBy => StageEvent::StandBy,
+            StageState::Teardown => self.teardown(),
         }
     }
 
@@ -184,13 +189,24 @@ where
         match event {
             StageEvent::WorkPartial => {
                 self.tick_count.inc(1);
+                trace!("partial work done");
             }
             StageEvent::WorkIdle => {
                 self.idle_count.inc(1);
+                trace!("work is idle");
             }
-            StageEvent::BootstrapError(x) => log_stage_error(&self.name, "BOOTSTRAP", x),
-            StageEvent::WorkError(x) => log_stage_error(&self.name, "WORK", x),
-            _ => (),
+            StageEvent::BootstrapError(x) => log_stage_error(x),
+            StageEvent::WorkError(x) => log_stage_error(x),
+            StageEvent::Dismissed => info!("stage dismissed"),
+            StageEvent::WorkDone => info!("stage work done"),
+            StageEvent::BootstrapOk => info!("stage bootstrap ok"),
+            StageEvent::TeardownOk => info!("stage teardown ok"),
+            StageEvent::TeardownError => error!("stage teardown error"),
+            StageEvent::StandBy => trace!("stage stand-by"),
+        }
+
+        if self.state != next_state {
+            info!(next = ?next_state, "switching state");
         }
     }
 
@@ -200,8 +216,8 @@ where
             StageEvent::WorkPartial => Some(StageState::Working),
             StageEvent::WorkIdle => Some(StageState::Idle),
             StageEvent::WorkDone => Some(StageState::StandBy),
-            StageEvent::WorkError(Error::ShouldRestart(_)) => Some(StageState::Bootstrap),
-            StageEvent::WorkError(Error::DismissableError(_)) => Some(StageState::Working),
+            StageEvent::WorkError(Error::ShouldRestart) => Some(StageState::Bootstrap),
+            StageEvent::WorkError(Error::DismissableError) => Some(StageState::Working),
             StageEvent::WorkError(Error::RecvIdle) => Some(StageState::Idle),
             StageEvent::WorkError(_) => Some(StageState::StandBy),
             StageEvent::BootstrapOk => Some(StageState::Working),
@@ -343,6 +359,7 @@ impl Default for Policy {
     }
 }
 
+#[instrument(name="stage", level = Level::INFO, skip_all, fields(stage = machine.name))]
 fn fullfil_stage<W>(mut machine: StageMachine<W>)
 where
     W: Worker,

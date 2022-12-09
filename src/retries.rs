@@ -4,6 +4,7 @@ use std::{
 };
 
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
+use tracing::{debug, warn};
 
 use crate::error::Error;
 
@@ -64,14 +65,14 @@ pub fn retry_operation<T>(
         let result = op();
 
         match result {
-            Err(Error::RetryableError(msg)) if retry < policy.max_retries => {
-                log::warn!("retryable operation error: {:?}", msg);
+            Err(Error::RetryableError) if retry < policy.max_retries => {
+                warn!("retryable operation error");
 
                 retry += 1;
 
                 let backoff = compute_backoff_delay(policy, retry);
 
-                log::debug!(
+                debug!(
                     "backoff for {}s until next retry #{}",
                     backoff.as_secs(),
                     retry
@@ -79,9 +80,9 @@ pub fn retry_operation<T>(
 
                 sleep_except_cancel(backoff, cancel);
             }
-            Err(Error::RetryableError(msg)) => {
-                log::debug!("max retries reached");
-                break Err(Error::RetryableError(msg));
+            Err(Error::RetryableError) => {
+                warn!("max retries reached");
+                break Err(Error::RetryableError);
             }
             x => break x,
         }
@@ -102,7 +103,7 @@ mod tests {
         let inner_counter = counter.clone();
         let op = move || -> Result<(), Error> {
             *inner_counter.borrow_mut() += 1;
-            Err(Error::RetryableError("very bad stuff happened".to_string()))
+            Err(Error::RetryableError)
         };
 
         let policy = Policy {
@@ -119,9 +120,7 @@ mod tests {
 
     #[test]
     fn honors_exponential_backoff() {
-        let op = move || -> Result<(), Error> {
-            Err(Error::RetryableError("very bad stuff happened".to_string()))
-        };
+        let op = move || -> Result<(), Error> { Err(Error::RetryableError) };
 
         let policy = Policy {
             max_retries: 10,
@@ -144,9 +143,7 @@ mod tests {
 
     #[test]
     fn honors_cancel() {
-        let op = move || -> Result<(), Error> {
-            Err(Error::RetryableError("very bad stuff happened".to_string()))
-        };
+        let op = move || -> Result<(), Error> { Err(Error::RetryableError) };
 
         let policy = Policy {
             max_retries: 100,
