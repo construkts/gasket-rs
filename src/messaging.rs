@@ -1,9 +1,13 @@
-use std::time::Duration;
+use std::{
+    ops::{Deref, DerefMut},
+    time::Duration,
+};
 
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::error::Error;
 
+#[derive(Debug, Default)]
 pub struct Message<T> {
     pub payload: T,
 }
@@ -112,6 +116,7 @@ pub trait RecvPort<T> {
     fn connect(&mut self, receiver: Receiver<Message<T>>);
 }
 
+#[derive(Clone)]
 pub struct InputPort<T> {
     counter: u64,
     receiver: Option<Receiver<Message<T>>>,
@@ -145,9 +150,9 @@ impl<T> InputPort<T> {
         }
     }
 
-    pub fn recv_or_idle(&mut self) -> Result<Message<T>, Error> {
+    pub fn recv_timeout(&mut self, duration: Duration) -> Result<Message<T>, Error> {
         match &self.receiver {
-            Some(receiver) => match receiver.recv_timeout(IDLE_TIMEOUT) {
+            Some(receiver) => match receiver.recv_timeout(duration) {
                 Ok(unit) => {
                     self.counter += 1;
                     Ok(unit)
@@ -157,6 +162,10 @@ impl<T> InputPort<T> {
             },
             None => Err(Error::NotConnected),
         }
+    }
+
+    pub fn recv_or_idle(&mut self) -> Result<Message<T>, Error> {
+        self.recv_timeout(IDLE_TIMEOUT)
     }
 }
 
@@ -212,6 +221,67 @@ impl<T> Default for TwoPhaseInputPort<T> {
             inner: Default::default(),
             staging: Default::default(),
         }
+    }
+}
+
+pub struct SinkPort<T>(InputPort<T>);
+
+impl<T> Deref for SinkPort<T> {
+    type Target = InputPort<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for SinkPort<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> Default for SinkPort<T> {
+    fn default() -> Self {
+        Self(InputPort::default())
+    }
+}
+
+impl<T> SinkPort<T> {
+    pub fn drain(&mut self) -> Result<Vec<Message<T>>, Error> {
+        let mut output = vec![];
+
+        loop {
+            match self.0.recv() {
+                Ok(msg) => {
+                    output.push(msg);
+                }
+                Err(err) => match err {
+                    Error::RecvIdle => break,
+                    x => return Err(x),
+                },
+            }
+        }
+
+        Ok(output)
+    }
+
+    pub fn drain_at_least<const M: usize>(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<[Message<T>; M], Error>
+    where
+        Message<T>: std::fmt::Debug,
+    {
+        let mut output = vec![];
+
+        while output.len() < M {
+            match self.0.recv_timeout(timeout) {
+                Ok(msg) => output.push(msg),
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(output.try_into().unwrap())
     }
 }
 
