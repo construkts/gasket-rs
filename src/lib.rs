@@ -1,3 +1,4 @@
+pub mod daemon;
 pub mod error;
 pub mod messaging;
 pub mod metrics;
