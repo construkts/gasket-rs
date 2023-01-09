@@ -33,6 +33,7 @@ pub trait SendPort<T> {
     fn connect(&mut self, sender: Sender<Message<T>>);
 }
 
+#[derive(Debug)]
 pub struct OutputPort<T> {
     sender: Option<Sender<Message<T>>>,
 }
@@ -116,7 +117,7 @@ pub trait RecvPort<T> {
     fn connect(&mut self, receiver: Receiver<Message<T>>);
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InputPort<T> {
     counter: u64,
     receiver: Option<Receiver<Message<T>>>,
@@ -334,4 +335,17 @@ pub fn connect_ports<T>(output: &mut impl SendPort<T>, input: &mut impl RecvPort
     let (sender, receiver) = crossbeam::channel::bounded(cap);
     output.connect(sender);
     input.connect(receiver);
+}
+
+pub fn funnel_ports<T>(
+    outputs: Vec<&mut impl SendPort<T>>,
+    input: &mut impl RecvPort<T>,
+    cap: usize,
+) {
+    let (sender, receiver) = crossbeam::channel::bounded(cap);
+    input.connect(receiver);
+
+    for output in outputs {
+        output.connect(sender.clone());
+    }
 }
