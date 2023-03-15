@@ -19,7 +19,7 @@ pub enum WorkOutcome {
     Idle,
     /// worker is working and need to keep working
     Partial,
-    /// worker has done all the owrk it needed
+    /// worker has done all the work it needed
     Done,
 }
 

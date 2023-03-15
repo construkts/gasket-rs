@@ -1,9 +1,4 @@
-use std::{
-    ops::{Deref, DerefMut},
-    time::Duration,
-};
-
-use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
+use std::{collections::VecDeque, marker::PhantomData, time::Duration};
 
 use crate::error::Error;
 
@@ -29,105 +24,154 @@ where
     }
 }
 
-pub trait SendPort<T> {
-    fn connect(&mut self, sender: Sender<Message<T>>);
+pub trait SendAdapter<P>: Send + Sync {
+    fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
 }
 
-#[derive(Debug)]
-pub struct OutputPort<T> {
-    sender: Option<Sender<Message<T>>>,
+pub trait SendPort<A, P>
+where
+    A: SendAdapter<P>,
+{
+    fn connect(&mut self, adapter: A);
 }
 
-impl<T> Clone for OutputPort<T> {
+pub struct OutputPort<A, P> {
+    sender: Option<A>,
+    _phantom: PhantomData<P>,
+}
+
+impl<A, P> Clone for OutputPort<A, P>
+where
+    A: Clone,
+{
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            _phantom: self._phantom.clone(),
         }
     }
 }
 
-impl<T> Default for OutputPort<T> {
+impl<A, P> Default for OutputPort<A, P> {
     fn default() -> Self {
         Self {
-            sender: Default::default(),
+            sender: None,
+            _phantom: Default::default(),
         }
     }
 }
 
-impl<T> OutputPort<T> {
-    pub fn send(&mut self, msg: Message<T>) -> Result<(), Error> {
-        match &self.sender {
-            Some(sender) => sender.send(msg).map_err(|_| Error::SendError),
+impl<A, P> OutputPort<A, P>
+where
+    A: SendAdapter<P>,
+{
+    pub fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+        match &mut self.sender {
+            Some(sender) => sender.send(msg),
             None => Err(Error::NotConnected),
         }
     }
 }
 
-impl<T> SendPort<T> for OutputPort<T> {
-    fn connect(&mut self, sender: Sender<Message<T>>) {
-        self.sender = Some(sender);
+impl<A, P> SendPort<A, P> for OutputPort<A, P>
+where
+    A: SendAdapter<P>,
+{
+    fn connect(&mut self, adapter: A) {
+        self.sender = Some(adapter);
     }
 }
 
-pub struct FanoutPort<T>
+pub struct FanoutPort<A, P>
 where
-    T: Clone,
+    A: Clone,
 {
-    senders: Vec<Sender<Message<T>>>,
+    senders: Vec<A>,
+    _phantom: PhantomData<P>,
 }
 
-impl<T> FanoutPort<T>
+impl<A, P> FanoutPort<A, P>
 where
-    T: Clone,
+    A: SendAdapter<P> + Clone,
+    P: Clone,
 {
-    pub fn send(&mut self, msg: Message<T>) -> Result<(), Error> {
+    pub fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
         if self.senders.is_empty() {
             return Err(Error::NotConnected);
         }
 
         for sender in self.senders.iter_mut() {
-            sender.send(msg.clone()).map_err(|_| Error::SendError)?;
+            sender.send(msg.clone())?;
         }
 
         Ok(())
     }
 }
 
-impl<T> SendPort<T> for FanoutPort<T>
+impl<A, P> SendPort<A, P> for FanoutPort<A, P>
 where
-    T: Clone,
+    A: SendAdapter<P> + Clone,
 {
-    fn connect(&mut self, sender: Sender<Message<T>>) {
-        self.senders.push(sender);
+    fn connect(&mut self, adapter: A) {
+        self.senders.push(adapter);
     }
 }
 
-impl<T> Default for FanoutPort<T>
+impl<A, P> Default for FanoutPort<A, P>
 where
-    T: Clone,
+    A: SendAdapter<P> + Clone,
 {
     fn default() -> Self {
         Self {
             senders: Vec::new(),
+            _phantom: Default::default(),
         }
     }
 }
 
-pub trait RecvPort<T> {
-    fn connect(&mut self, receiver: Receiver<Message<T>>);
+pub trait RecvAdapter<P>: Send + Sync {
+    fn recv(&mut self) -> Result<Message<P>, Error>;
+    fn recv_timeout(&mut self, duration: Duration) -> Result<Message<P>, Error>;
 }
 
-#[derive(Clone, Debug)]
-pub struct InputPort<T> {
+pub trait RecvPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
+    fn connect(&mut self, adapter: A);
+}
+
+pub struct InputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
     counter: u64,
-    receiver: Option<Receiver<Message<T>>>,
+    receiver: Option<A>,
+    _phantom: PhantomData<P>,
 }
 
-impl<T> Default for InputPort<T> {
+impl<A, P> Default for InputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
     fn default() -> Self {
         Self {
             counter: 0,
             receiver: Default::default(),
+            _phantom: Default::default(),
+        }
+    }
+}
+
+impl<A, P> Clone for InputPort<A, P>
+where
+    A: RecvAdapter<P> + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            counter: self.counter.clone(),
+            receiver: self.receiver.clone(),
+            _phantom: self._phantom.clone(),
         }
     }
 }
@@ -137,55 +181,54 @@ impl<T> Default for InputPort<T> {
 // calculate a more accurate timeout instead of relying on a magic number.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
 
-impl<T> InputPort<T> {
-    pub fn recv(&mut self) -> Result<Message<T>, Error> {
-        match &self.receiver {
-            Some(receiver) => match receiver.recv() {
-                Ok(unit) => {
-                    self.counter += 1;
-                    Ok(unit)
-                }
-                Err(_) => Err(Error::RecvError),
-            },
-            None => Err(Error::NotConnected),
-        }
+impl<A, P> InputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
+    pub fn recv(&mut self) -> Result<Message<P>, Error> {
+        let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
+        let msg = receiver.recv()?;
+        self.counter += 1;
+
+        Ok(msg)
     }
 
-    pub fn recv_timeout(&mut self, duration: Duration) -> Result<Message<T>, Error> {
-        match &self.receiver {
-            Some(receiver) => match receiver.recv_timeout(duration) {
-                Ok(unit) => {
-                    self.counter += 1;
-                    Ok(unit)
-                }
-                Err(RecvTimeoutError::Timeout) => Err(Error::RecvIdle),
-                Err(_) => Err(Error::RecvError),
-            },
-            None => Err(Error::NotConnected),
-        }
+    pub fn recv_timeout(&mut self, duration: Duration) -> Result<Message<P>, Error> {
+        let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
+        let msg = receiver.recv_timeout(duration)?;
+        self.counter += 1;
+
+        Ok(msg)
     }
 
-    pub fn recv_or_idle(&mut self) -> Result<Message<T>, Error> {
+    pub fn recv_or_idle(&mut self) -> Result<Message<P>, Error> {
         self.recv_timeout(IDLE_TIMEOUT)
     }
 }
 
-impl<T> RecvPort<T> for InputPort<T> {
-    fn connect(&mut self, receiver: Receiver<Message<T>>) {
-        self.receiver = Some(receiver);
+impl<A, P> RecvPort<A, P> for InputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
+    fn connect(&mut self, adapter: A) {
+        self.receiver = Some(adapter);
     }
 }
 
-pub struct TwoPhaseInputPort<T> {
-    inner: InputPort<T>,
-    staging: Option<Message<T>>,
+pub struct TwoPhaseInputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
+    inner: InputPort<A, P>,
+    staging: Option<Message<P>>,
 }
 
-impl<T> TwoPhaseInputPort<T>
+impl<A, P> TwoPhaseInputPort<A, P>
 where
-    T: Clone,
+    A: RecvAdapter<P>,
+    P: Clone,
 {
-    pub fn recv(&mut self) -> Result<Message<T>, Error> {
+    pub fn recv(&mut self) -> Result<Message<P>, Error> {
         if self.staging.is_none() {
             let x = self.inner.recv()?;
             self.staging = Some(x);
@@ -195,7 +238,7 @@ where
         Ok(x.clone())
     }
 
-    pub fn recv_or_idle(&mut self) -> Result<Message<T>, Error> {
+    pub fn recv_or_idle(&mut self) -> Result<Message<P>, Error> {
         if self.staging.is_none() {
             let x = self.inner.recv()?;
             self.staging = Some(x);
@@ -210,13 +253,19 @@ where
     }
 }
 
-impl<T> RecvPort<T> for TwoPhaseInputPort<T> {
-    fn connect(&mut self, receiver: Receiver<Message<T>>) {
-        self.inner.connect(receiver);
+impl<A, P> RecvPort<A, P> for TwoPhaseInputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
+    fn connect(&mut self, adapter: A) {
+        self.inner.connect(adapter);
     }
 }
 
-impl<T> Default for TwoPhaseInputPort<T> {
+impl<A, P> Default for TwoPhaseInputPort<A, P>
+where
+    A: RecvAdapter<P>,
+{
     fn default() -> Self {
         Self {
             inner: Default::default(),
@@ -225,127 +274,155 @@ impl<T> Default for TwoPhaseInputPort<T> {
     }
 }
 
-pub struct SinkPort<T>(InputPort<T>);
-
-impl<T> Deref for SinkPort<T> {
-    type Target = InputPort<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub struct SinkAdapter<P> {
+    cap: Option<usize>,
+    buffer: VecDeque<Message<P>>,
 }
 
-impl<T> DerefMut for SinkPort<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+impl<P> SendAdapter<P> for SinkAdapter<P>
+where
+    P: Send + Sync,
+{
+    fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+        self.buffer.push_back(msg);
 
-impl<T> Default for SinkPort<T> {
-    fn default() -> Self {
-        Self(InputPort::default())
-    }
-}
-
-impl<T> SinkPort<T> {
-    pub fn drain(&mut self) -> Result<Vec<Message<T>>, Error> {
-        let mut output = vec![];
-
-        loop {
-            match self.0.recv() {
-                Ok(msg) => {
-                    output.push(msg);
-                }
-                Err(err) => match err {
-                    Error::RecvIdle => break,
-                    x => return Err(x),
-                },
+        if let Some(cap) = self.cap {
+            while self.buffer.len() > cap {
+                self.buffer.pop_back();
             }
         }
 
-        Ok(output)
-    }
-
-    pub fn drain_at_least<const M: usize>(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<[Message<T>; M], Error>
-    where
-        Message<T>: std::fmt::Debug,
-    {
-        let mut output = vec![];
-
-        while output.len() < M {
-            match self.0.recv_timeout(timeout) {
-                Ok(msg) => output.push(msg),
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(output.try_into().unwrap())
+        Ok(())
     }
 }
 
-pub struct FunnelPort<T> {
-    receivers: Vec<Receiver<Message<T>>>,
-}
-
-impl<T> FunnelPort<T> {
-    pub fn recv(&mut self) -> Result<Message<T>, Error> {
-        let mut select = crossbeam::channel::Select::new();
-
-        for recv in self.receivers.iter() {
-            select.recv(recv);
-        }
-
-        loop {
-            // Wait until a receive operation becomes ready and try executing it.
-            let index = select.ready();
-
-            let res = self.receivers[index].try_recv();
-
-            // If the operation turns out not to be ready, retry.
-            if let Err(e) = res {
-                if e.is_empty() {
-                    continue;
-                }
-            }
-
-            // Success!
-            return res.map_err(|_| Error::RecvError);
-        }
-    }
-}
-
-impl<T> RecvPort<T> for FunnelPort<T> {
-    fn connect(&mut self, receiver: Receiver<Message<T>>) {
-        self.receivers.push(receiver);
-    }
-}
-
-impl<T> Default for FunnelPort<T> {
-    fn default() -> Self {
+impl<P> SinkAdapter<P> {
+    pub fn new(cap: Option<usize>) -> Self {
         Self {
-            receivers: Vec::new(),
+            cap,
+            buffer: Default::default(),
         }
+    }
+
+    pub fn drain(&mut self) -> Vec<Message<P>> {
+        self.buffer.drain(..).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
     }
 }
 
-pub fn connect_ports<T>(output: &mut impl SendPort<T>, input: &mut impl RecvPort<T>, cap: usize) {
-    let (sender, receiver) = crossbeam::channel::bounded(cap);
-    output.connect(sender);
-    input.connect(receiver);
+pub struct MapSendAdapter<I, F, T>
+where
+    I: SendAdapter<T>,
+{
+    inner: I,
+    mapper: fn(F) -> Option<T>,
 }
 
-pub fn funnel_ports<T>(
-    outputs: Vec<&mut impl SendPort<T>>,
-    input: &mut impl RecvPort<T>,
-    cap: usize,
-) {
-    let (sender, receiver) = crossbeam::channel::bounded(cap);
-    input.connect(receiver);
+impl<I, F, T> MapSendAdapter<I, F, T>
+where
+    I: SendAdapter<T>,
+{
+    pub fn new(inner: I, mapper: fn(F) -> Option<T>) -> Self {
+        Self { inner, mapper }
+    }
+}
 
-    for output in outputs {
-        output.connect(sender.clone());
+impl<I, F, T> SendAdapter<F> for MapSendAdapter<I, F, T>
+where
+    I: SendAdapter<T>,
+{
+    fn send(&mut self, msg: Message<F>) -> Result<(), Error> {
+        let out = (self.mapper)(msg.payload);
+
+        if let Some(payload) = out {
+            self.inner.send(Message::from(payload))?;
+        }
+
+        Ok(())
+    }
+}
+
+pub mod crossbeam {
+    use super::*;
+
+    use ::crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
+
+    pub struct ChannelSendAdapter<P>(Sender<Message<P>>);
+
+    impl<P> Clone for ChannelSendAdapter<P> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl<P> SendAdapter<P> for ChannelSendAdapter<P>
+    where
+        P: Send + Sync,
+    {
+        fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+            self.0.send(msg).map_err(|_| Error::SendError)
+        }
+    }
+
+    pub struct ChannelRecvAdapter<P>(Receiver<Message<P>>);
+
+    impl<P> Clone for ChannelRecvAdapter<P> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl<P> RecvAdapter<P> for ChannelRecvAdapter<P>
+    where
+        P: Send + Sync,
+    {
+        fn recv(&mut self) -> Result<Message<P>, Error> {
+            self.0.recv().map_err(|_| Error::RecvError)
+        }
+
+        fn recv_timeout(&mut self, duration: Duration) -> Result<Message<P>, Error> {
+            self.0.recv_timeout(duration).map_err(|err| match err {
+                RecvTimeoutError::Timeout => Error::RecvIdle,
+                RecvTimeoutError::Disconnected => Error::RecvError,
+            })
+        }
+    }
+
+    pub type OutputPort<P> = super::OutputPort<ChannelSendAdapter<P>, P>;
+    pub type InputPort<P> = super::InputPort<ChannelRecvAdapter<P>, P>;
+    pub type TwoPhaseInputPort<P> = super::TwoPhaseInputPort<ChannelRecvAdapter<P>, P>;
+    pub type MapSendAdapter<F, T> = super::MapSendAdapter<ChannelSendAdapter<T>, F, T>;
+
+    pub fn channel<P>(cap: usize) -> (ChannelSendAdapter<P>, ChannelRecvAdapter<P>) {
+        let (sender, receiver) = ::crossbeam::channel::bounded(cap);
+        (ChannelSendAdapter(sender), ChannelRecvAdapter(receiver))
+    }
+
+    pub fn connect_ports<O, I, P>(output: &mut O, input: &mut I, cap: usize)
+    where
+        O: SendPort<ChannelSendAdapter<P>, P>,
+        I: RecvPort<ChannelRecvAdapter<P>, P>,
+        P: 'static + Send + Sync,
+    {
+        let (sender, receiver) = channel::<P>(cap);
+        output.connect(sender);
+        input.connect(receiver);
+    }
+
+    pub fn funnel_ports<O, I, P>(outputs: Vec<&mut O>, input: &mut I, cap: usize)
+    where
+        O: SendPort<ChannelSendAdapter<P>, P>,
+        I: RecvPort<ChannelRecvAdapter<P>, P>,
+        P: 'static + Send + Sync,
+    {
+        let (sender, receiver) = channel::<P>(cap);
+        input.connect(receiver);
+
+        for output in outputs {
+            output.connect(sender.clone());
+        }
     }
 }
