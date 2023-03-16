@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use gasket::{
-    messaging::{connect_ports, InputPort, OutputPort, TwoPhaseInputPort},
+    messaging::crossbeam::{connect_ports, InputPort, OutputPort, TwoPhaseInputPort},
     metrics::{self, Counter, Registry},
     retries,
     runtime::{spawn_stage, Policy, WorkOutcome, WorkResult, Worker},
