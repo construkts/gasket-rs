@@ -12,48 +12,42 @@ use crate::metrics::{collect_readings, Readings};
 use crate::retries;
 use crate::{error::Error, metrics};
 
-pub type WorkResult = Result<WorkOutcome, Error>;
-
-pub enum WorkOutcome {
+pub enum WorkSchedule<U> {
     /// worker is not doing anything, but might in the future
     Idle,
-    /// worker is working and need to keep working
-    Partial,
+    /// a work unit should be executed
+    Unit(U),
+    /// Worker is disconnected from a required port
+    Disconnected,
     /// worker has done all the work it needed
     Done,
 }
 
+pub type ScheduleResult<U> = Result<WorkSchedule<U>, Error>;
+
 pub trait Worker: Send {
+    type WorkUnit: Sized;
+
     fn metrics(&self) -> metrics::Registry;
 
-    fn work(&mut self) -> WorkResult;
+    /// Schedule the next work unit for execution
+    ///
+    /// This usually means reading messages from input ports and returning a
+    /// work unit that contains all data required for execution.
+    async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit>;
 
-    fn bootstrap(&mut self) -> Result<(), Error> {
-        info!("noop bootstrap complete");
-        Ok(())
+    /// Execute the action described by the work unit
+    ///
+    /// This usually means doing required computation, generating side-effect
+    /// and submitting message through the output ports
+    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error>;
+
+    async fn bootstrap(&mut self) -> ScheduleResult<Self::WorkUnit> {
+        Ok(WorkSchedule::Done)
     }
 
-    fn teardown(&mut self) -> Result<(), Error> {
-        info!("noop teardown complete");
-        Ok(())
-    }
-}
-
-impl Worker for Box<dyn Worker> {
-    fn metrics(&self) -> metrics::Registry {
-        self.deref().metrics()
-    }
-
-    fn work(&mut self) -> WorkResult {
-        self.deref_mut().work()
-    }
-
-    fn bootstrap(&mut self) -> Result<(), Error> {
-        self.deref_mut().bootstrap()
-    }
-
-    fn teardown(&mut self) -> Result<(), Error> {
-        self.deref_mut().teardown()
+    async fn teardown(&mut self) -> ScheduleResult<Self::WorkUnit> {
+        Ok(WorkSchedule::Done)
     }
 }
 
@@ -72,6 +66,7 @@ pub enum StageEvent {
     WorkPartial,
     WorkIdle,
     WorkDone,
+    MessagingError,
     WorkError(Error),
     BootstrapOk,
     BootstrapError(Error),
@@ -124,50 +119,90 @@ where
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    fn bootstrap(&mut self) -> StageEvent {
-        let result = retries::retry_operation(
-            || self.worker.bootstrap(),
-            &self.policy.bootstrap_retry,
-            Some(&self.anchor.dismissed),
-        );
+    async fn bootstrap(&mut self) -> StageEvent {
+        let schedule = match self.worker.bootstrap().await {
+            Ok(x) => x,
+            Err(x) => return StageEvent::WorkError(x),
+        };
 
-        match result {
-            Ok(()) => StageEvent::BootstrapOk,
-            Err(err) => StageEvent::BootstrapError(err),
+        match schedule {
+            WorkSchedule::Done => StageEvent::BootstrapOk,
+            WorkSchedule::Disconnected => StageEvent::MessagingError,
+            WorkSchedule::Unit(mut unit) => {
+                let result = retries::retry_unit(
+                    &mut self.worker,
+                    &mut unit,
+                    &self.policy.bootstrap_retry,
+                    Some(&self.anchor.dismissed),
+                )
+                .await;
+
+                match result {
+                    Ok(_) => StageEvent::BootstrapOk,
+                    Err(err) => StageEvent::BootstrapError(err),
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    fn work(&mut self) -> StageEvent {
-        let result = retries::retry_operation(
-            || self.worker.work(),
-            &self.policy.work_retry,
-            Some(&self.anchor.dismissed),
-        );
+    async fn work(&mut self) -> StageEvent {
+        let schedule = match self.worker.schedule().await {
+            Ok(x) => x,
+            Err(x) => return StageEvent::WorkError(x),
+        };
 
-        match result {
-            Ok(WorkOutcome::Partial) => StageEvent::WorkPartial,
-            Ok(WorkOutcome::Idle) => StageEvent::WorkIdle,
-            Ok(WorkOutcome::Done) => StageEvent::WorkDone,
-            Err(err) => StageEvent::WorkError(err),
+        match schedule {
+            WorkSchedule::Idle => StageEvent::WorkIdle,
+            WorkSchedule::Done => StageEvent::WorkDone,
+            WorkSchedule::Disconnected => StageEvent::MessagingError,
+            WorkSchedule::Unit(mut unit) => {
+                let result = retries::retry_unit(
+                    &mut self.worker,
+                    &mut unit,
+                    &self.policy.work_retry,
+                    Some(&self.anchor.dismissed),
+                )
+                .await;
+
+                match result {
+                    Ok(_) => StageEvent::WorkPartial,
+                    Err(err) => StageEvent::WorkError(err),
+                }
+            }
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    fn teardown(&mut self) -> StageEvent {
-        let result = retries::retry_operation(
-            || self.worker.teardown(),
-            &self.policy.teardown_retry,
-            Some(&self.anchor.dismissed),
-        );
+    async fn teardown(&mut self) -> StageEvent {
+        let schedule = match self.worker.teardown().await {
+            Ok(x) => x,
+            Err(x) => return StageEvent::WorkError(x),
+        };
 
-        match result {
-            Ok(_) => StageEvent::TeardownOk,
-            Err(_) => StageEvent::TeardownError,
+        match schedule {
+            WorkSchedule::Done => StageEvent::TeardownOk,
+            WorkSchedule::Disconnected => StageEvent::MessagingError,
+            WorkSchedule::Unit(mut unit) => {
+                let result = retries::retry_unit(
+                    &mut self.worker,
+                    &mut unit,
+                    &self.policy.bootstrap_retry,
+                    Some(&self.anchor.dismissed),
+                )
+                .await;
+
+                match result {
+                    Ok(_) => StageEvent::TeardownOk,
+                    Err(err) => StageEvent::TeardownError,
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
-    fn actuate(&mut self) -> StageEvent {
+    async fn actuate(&mut self) -> StageEvent {
         // if stage is dismissed, return early
         let is_dismissed = self.anchor.dismissed.load();
         if self.state != StageState::Teardown && is_dismissed {
@@ -175,10 +210,10 @@ where
         }
 
         match self.state {
-            StageState::Bootstrap => self.bootstrap(),
-            StageState::Idle | StageState::Working => self.work(),
+            StageState::Bootstrap => self.bootstrap().await,
+            StageState::Idle | StageState::Working => self.work().await,
             StageState::StandBy => StageEvent::StandBy,
-            StageState::Teardown => self.teardown(),
+            StageState::Teardown => self.teardown().await,
         }
     }
 
@@ -197,12 +232,13 @@ where
             }
             StageEvent::BootstrapError(x) => log_stage_error(x),
             StageEvent::WorkError(x) => log_stage_error(x),
+            StageEvent::MessagingError => error!("messaging error"),
             StageEvent::Dismissed => info!("stage dismissed"),
             StageEvent::WorkDone => info!("stage work done"),
             StageEvent::BootstrapOk => info!("stage bootstrap ok"),
             StageEvent::TeardownOk => info!("stage teardown ok"),
             StageEvent::TeardownError => error!("stage teardown error"),
-            StageEvent::StandBy => trace!("stage stand-by"),
+            StageEvent::StandBy => (),
         }
 
         if self.state != next_state {
@@ -220,6 +256,7 @@ where
             StageEvent::WorkError(Error::DismissableError) => Some(StageState::Working),
             StageEvent::WorkError(Error::RecvIdle) => Some(StageState::Idle),
             StageEvent::WorkError(_) => Some(StageState::StandBy),
+            StageEvent::MessagingError => Some(StageState::StandBy),
             StageEvent::BootstrapOk => Some(StageState::Working),
             StageEvent::BootstrapError(_) => Some(StageState::StandBy),
             StageEvent::StandBy => Some(StageState::StandBy),
@@ -228,8 +265,8 @@ where
         }
     }
 
-    fn transition(&mut self) -> Option<StageState> {
-        let event = self.actuate();
+    async fn transition(&mut self) -> Option<StageState> {
+        let event = self.actuate().await;
         let next = self.apply(&event);
 
         match next {
@@ -364,16 +401,12 @@ fn fullfil_stage<W>(mut machine: StageMachine<W>)
 where
     W: Worker,
 {
-    let backoff = Backoff::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    while let Some(state) = machine.transition() {
-        match state {
-            StageState::Idle | StageState::StandBy => {
-                backoff.snooze();
-            }
-            _ => (),
-        }
-    }
+    rt.block_on(async { while let Some(_) = machine.transition().await {} });
 }
 
 pub fn spawn_stage<W>(worker: W, policy: Policy, name: Option<&str>) -> Tether

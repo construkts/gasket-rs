@@ -25,7 +25,7 @@ where
 }
 
 pub trait SendAdapter<P>: Send + Sync {
-    fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
+    async fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
 }
 
 pub trait SendPort<A, P>
@@ -65,9 +65,9 @@ impl<A, P> OutputPort<A, P>
 where
     A: SendAdapter<P>,
 {
-    pub fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+    pub async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
         match &mut self.sender {
-            Some(sender) => sender.send(msg),
+            Some(sender) => sender.send(msg).await,
             None => Err(Error::NotConnected),
         }
     }
@@ -95,13 +95,13 @@ where
     A: SendAdapter<P> + Clone,
     P: Clone,
 {
-    pub fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+    pub async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
         if self.senders.is_empty() {
             return Err(Error::NotConnected);
         }
 
         for sender in self.senders.iter_mut() {
-            sender.send(msg.clone())?;
+            sender.send(msg.clone()).await?;
         }
 
         Ok(())
@@ -130,8 +130,8 @@ where
 }
 
 pub trait RecvAdapter<P>: Send + Sync {
-    fn recv(&mut self) -> Result<Message<P>, Error>;
-    fn recv_timeout(&mut self, duration: Duration) -> Result<Message<P>, Error>;
+    async fn recv(&mut self) -> Result<Message<P>, Error>;
+    fn try_recv(&mut self) -> Result<Message<P>, Error>;
 }
 
 pub trait RecvPort<A, P>
@@ -176,33 +176,24 @@ where
     }
 }
 
-// TODO: there should a notion of what's the expected throughput for each port,
-// it could be a value set at the port level. This could give us a way to
-// calculate a more accurate timeout instead of relying on a magic number.
-const IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
-
 impl<A, P> InputPort<A, P>
 where
     A: RecvAdapter<P>,
 {
-    pub fn recv(&mut self) -> Result<Message<P>, Error> {
+    pub async fn recv(&mut self) -> Result<Message<P>, Error> {
         let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
-        let msg = receiver.recv()?;
+        let msg = receiver.recv().await?;
         self.counter += 1;
 
         Ok(msg)
     }
 
-    pub fn recv_timeout(&mut self, duration: Duration) -> Result<Message<P>, Error> {
+    pub fn try_recv(&mut self) -> Result<Message<P>, Error> {
         let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
-        let msg = receiver.recv_timeout(duration)?;
+        let msg = receiver.try_recv()?;
         self.counter += 1;
 
         Ok(msg)
-    }
-
-    pub fn recv_or_idle(&mut self) -> Result<Message<P>, Error> {
-        self.recv_timeout(IDLE_TIMEOUT)
     }
 }
 
@@ -215,65 +206,6 @@ where
     }
 }
 
-pub struct TwoPhaseInputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
-    inner: InputPort<A, P>,
-    staging: Option<Message<P>>,
-}
-
-impl<A, P> TwoPhaseInputPort<A, P>
-where
-    A: RecvAdapter<P>,
-    P: Clone,
-{
-    pub fn recv(&mut self) -> Result<Message<P>, Error> {
-        if self.staging.is_none() {
-            let x = self.inner.recv()?;
-            self.staging = Some(x);
-        }
-
-        let x = self.staging.as_ref().unwrap();
-        Ok(x.clone())
-    }
-
-    pub fn recv_or_idle(&mut self) -> Result<Message<P>, Error> {
-        if self.staging.is_none() {
-            let x = self.inner.recv()?;
-            self.staging = Some(x);
-        }
-
-        let x = self.staging.as_ref().unwrap();
-        Ok(x.clone())
-    }
-
-    pub fn commit(&mut self) {
-        self.staging = None;
-    }
-}
-
-impl<A, P> RecvPort<A, P> for TwoPhaseInputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
-    fn connect(&mut self, adapter: A) {
-        self.inner.connect(adapter);
-    }
-}
-
-impl<A, P> Default for TwoPhaseInputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-            staging: Default::default(),
-        }
-    }
-}
-
 pub struct SinkAdapter<P> {
     cap: Option<usize>,
     buffer: VecDeque<Message<P>>,
@@ -283,7 +215,7 @@ impl<P> SendAdapter<P> for SinkAdapter<P>
 where
     P: Send + Sync,
 {
-    fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+    async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
         self.buffer.push_back(msg);
 
         if let Some(cap) = self.cap {
@@ -334,21 +266,21 @@ impl<I, F, T> SendAdapter<F> for MapSendAdapter<I, F, T>
 where
     I: SendAdapter<T>,
 {
-    fn send(&mut self, msg: Message<F>) -> Result<(), Error> {
+    async fn send(&mut self, msg: Message<F>) -> Result<(), Error> {
         let out = (self.mapper)(msg.payload);
 
         if let Some(payload) = out {
-            self.inner.send(Message::from(payload))?;
+            self.inner.send(Message::from(payload)).await?;
         }
 
         Ok(())
     }
 }
 
-pub mod crossbeam {
+pub mod tokio {
     use super::*;
 
-    use ::crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
+    use ::tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender};
 
     pub struct ChannelSendAdapter<P>(Sender<Message<P>>);
 
@@ -362,42 +294,38 @@ pub mod crossbeam {
     where
         P: Send + Sync,
     {
-        fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
-            self.0.send(msg).map_err(|_| Error::SendError)
+        async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
+            self.0.send(msg).await.map_err(|_| Error::SendError)
         }
     }
 
     pub struct ChannelRecvAdapter<P>(Receiver<Message<P>>);
 
-    impl<P> Clone for ChannelRecvAdapter<P> {
-        fn clone(&self) -> Self {
-            Self(self.0.clone())
-        }
-    }
-
     impl<P> RecvAdapter<P> for ChannelRecvAdapter<P>
     where
         P: Send + Sync,
     {
-        fn recv(&mut self) -> Result<Message<P>, Error> {
-            self.0.recv().map_err(|_| Error::RecvError)
+        async fn recv(&mut self) -> Result<Message<P>, Error> {
+            match self.0.recv().await {
+                Some(x) => Ok(x),
+                None => Err(Error::RecvError),
+            }
         }
 
-        fn recv_timeout(&mut self, duration: Duration) -> Result<Message<P>, Error> {
-            self.0.recv_timeout(duration).map_err(|err| match err {
-                RecvTimeoutError::Timeout => Error::RecvIdle,
-                RecvTimeoutError::Disconnected => Error::RecvError,
+        fn try_recv(&mut self) -> Result<Message<P>, Error> {
+            self.0.try_recv().map_err(|err| match err {
+                TryRecvError::Empty => Error::RecvIdle,
+                TryRecvError::Disconnected => Error::RecvError,
             })
         }
     }
 
     pub type OutputPort<P> = super::OutputPort<ChannelSendAdapter<P>, P>;
     pub type InputPort<P> = super::InputPort<ChannelRecvAdapter<P>, P>;
-    pub type TwoPhaseInputPort<P> = super::TwoPhaseInputPort<ChannelRecvAdapter<P>, P>;
     pub type MapSendAdapter<F, T> = super::MapSendAdapter<ChannelSendAdapter<T>, F, T>;
 
     pub fn channel<P>(cap: usize) -> (ChannelSendAdapter<P>, ChannelRecvAdapter<P>) {
-        let (sender, receiver) = ::crossbeam::channel::bounded(cap);
+        let (sender, receiver) = ::tokio::sync::mpsc::channel(cap);
         (ChannelSendAdapter(sender), ChannelRecvAdapter(receiver))
     }
 

@@ -6,7 +6,7 @@ use std::{
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
 use tracing::{debug, warn};
 
-use crate::error::Error;
+use crate::{error::Error, runtime::Worker};
 
 #[derive(Clone)]
 pub struct Policy {
@@ -50,11 +50,15 @@ pub fn sleep_except_cancel(duration: Duration, cancel: Option<&AtomicCell<bool>>
     }
 }
 
-pub fn retry_operation<T>(
-    mut op: impl FnMut() -> Result<T, Error>,
+pub async fn retry_unit<W>(
+    worker: &mut W,
+    unit: &mut W::WorkUnit,
     policy: &Policy,
     cancel: Option<&AtomicCell<bool>>,
-) -> Result<T, Error> {
+) -> Result<(), Error>
+where
+    W: Worker,
+{
     let mut retry = 0;
 
     loop {
@@ -62,7 +66,7 @@ pub fn retry_operation<T>(
             break Err(Error::Cancelled);
         }
 
-        let result = op();
+        let result = worker.execute(unit).await;
 
         match result {
             Err(Error::RetryableError) if retry < policy.max_retries => {
@@ -91,20 +95,29 @@ pub fn retry_operation<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc};
+    use std::sync::Arc;
 
     use super::*;
 
-    #[test]
-    fn honors_max_retries() {
-        let counter = Rc::new(RefCell::new(0));
-        let cancel = AtomicCell::new(false);
+    struct FailingUnit {
+        attempt: u16,
+        delay: Option<Duration>,
+    }
 
-        let inner_counter = counter.clone();
-        let op = move || -> Result<(), Error> {
-            *inner_counter.borrow_mut() += 1;
+    impl WorkUnit for FailingUnit {
+        async fn attempt(&mut self) -> Result<(), Error> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            self.attempt += 1;
             Err(Error::RetryableError)
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn honors_max_retries() {
+        let cancel = AtomicCell::new(false);
 
         let policy = Policy {
             max_retries: 3,
@@ -113,14 +126,24 @@ mod tests {
             max_backoff: Duration::from_secs(100),
         };
 
-        assert!(retry_operation(op, &policy, Some(&cancel)).is_err());
+        let mut u1 = FailingUnit {
+            attempt: 0,
+            delay: Duration::from_secs(1).into(),
+        };
 
-        assert_eq!(*counter.borrow(), 4);
+        let result = retry_unit(&mut u1, &policy, Some(&cancel)).await;
+
+        assert!(result.is_err());
+
+        assert_eq!(u1.attempt, 4);
     }
 
-    #[test]
-    fn honors_exponential_backoff() {
-        let op = move || -> Result<(), Error> { Err(Error::RetryableError) };
+    #[tokio::test]
+    async fn honors_exponential_backoff() {
+        let mut u1 = FailingUnit {
+            attempt: 0,
+            delay: None,
+        };
 
         let policy = Policy {
             max_retries: 10,
@@ -131,7 +154,8 @@ mod tests {
 
         let start = std::time::Instant::now();
         let cancel = AtomicCell::new(false);
-        let result = retry_operation(op, &policy, Some(&cancel));
+
+        let result = retry_unit(&mut u1, &policy, Some(&cancel)).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_err());
@@ -141,9 +165,12 @@ mod tests {
         assert!(elapsed.as_millis() <= 2250);
     }
 
-    #[test]
-    fn honors_cancel() {
-        let op = move || -> Result<(), Error> { Err(Error::RetryableError) };
+    #[tokio::test]
+    async fn honors_cancel() {
+        let mut u1 = FailingUnit {
+            attempt: 0,
+            delay: None,
+        };
 
         let policy = Policy {
             max_retries: 100,
@@ -161,7 +188,7 @@ mod tests {
             cancel2.store(true);
         });
 
-        let result = retry_operation(op, &policy, Some(&cancel));
+        let result = retry_unit(&mut u1, &policy, Some(&cancel)).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_err());
