@@ -8,17 +8,18 @@ use std::{
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
 use tracing::{debug, error, info, instrument, trace, warn, Level};
 
-use crate::metrics::{collect_readings, Readings};
 use crate::retries;
 use crate::{error::Error, metrics};
+use crate::{
+    metrics::{collect_readings, Readings},
+    retries::Retry,
+};
 
 pub enum WorkSchedule<U> {
     /// worker is not doing anything, but might in the future
     Idle,
     /// a work unit should be executed
     Unit(U),
-    /// Worker is disconnected from a required port
-    Disconnected,
     /// worker has done all the work it needed
     Done,
 }
@@ -42,64 +43,115 @@ pub trait Worker: Send {
     /// and submitting message through the output ports
     async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error>;
 
-    async fn bootstrap(&mut self) -> ScheduleResult<Self::WorkUnit> {
-        Ok(WorkSchedule::Done)
+    /// Called before any work is performed and after each restart
+    async fn bootstrap(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 
-    async fn teardown(&mut self) -> ScheduleResult<Self::WorkUnit> {
-        Ok(WorkSchedule::Done)
+    async fn teardown(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub enum StageState {
+pub enum StagePhase {
     Bootstrap,
     Working,
-    Idle,
-    StandBy,
     Teardown,
+    Ended,
+}
+
+#[derive(Clone, Debug)]
+pub enum StageState<W>
+where
+    W: Worker,
+{
+    Bootstrap(Retry),
+    Scheduling(Retry),
+    Executing(W::WorkUnit, Retry),
+    Teardown(Retry),
+    Ended,
+}
+
+impl<W> From<&StageState<W>> for StagePhase
+where
+    W: Worker,
+{
+    fn from(value: &StageState<W>) -> Self {
+        match value {
+            StageState::Bootstrap(_) => Self::Bootstrap,
+            StageState::Scheduling(..) => Self::Working,
+            StageState::Executing(..) => Self::Working,
+            StageState::Teardown(_) => Self::Teardown,
+            StageState::Ended => Self::Ended,
+        }
+    }
 }
 
 #[derive(Debug)]
-pub enum StageEvent {
+pub enum StageEvent<W>
+where
+    W: Worker,
+{
     Dismissed,
-    WorkPartial,
-    WorkIdle,
-    WorkDone,
+    WorkerIdle,
+    WorkerDone,
     MessagingError,
-    WorkError(Error),
+    NextUnit(W::WorkUnit),
+    ScheduleError(Error, Retry),
+    ExecuteOk,
+    ExecuteError(W::WorkUnit, Error, Retry),
     BootstrapOk,
-    BootstrapError(Error),
+    BootstrapError(Error, Retry),
     TeardownOk,
-    TeardownError,
-    StandBy,
+    TeardownError(Error, Retry),
 }
 
 struct StageMachine<W>
 where
     W: Worker,
 {
-    state: StageState,
+    state: Option<StageState<W>>,
     anchor: Arc<Anchor>,
     policy: Policy,
     name: String,
     tick_count: metrics::Counter,
-    idle_count: metrics::Counter,
     worker: W,
 }
 
 #[inline]
-fn log_stage_error(x: &Error) {
-    match x {
-        Error::RecvIdle => debug!("input port idle"),
-        Error::ShouldRestart => warn!("stage should restart"),
-        Error::RetryableError => warn!("work should be retried"),
-        Error::WorkPanic => error!("work panic"),
-        Error::RecvError => error!("stage error while receiving message"),
-        Error::SendError => error!("stage error while sending message"),
-        Error::NotConnected => error!("stage not connected",),
-        x => error!("stage error {}", x),
+fn log_stage_error(err: &Error, retry: &Retry) {
+    match err {
+        Error::ShouldRestart => warn!(?retry, "stage should restart"),
+        Error::RetryableError => warn!(?retry, "work should be retried"),
+        Error::WorkPanic => error!(?retry, "work panic"),
+        Error::RecvError => error!(?retry, "stage error while receiving message"),
+        Error::SendError => error!(?retry, "stage error while sending message"),
+        Error::NotConnected => error!(?retry, "stage not connected",),
+        x => error!(?retry, "stage error {}", x),
     };
+}
+
+#[inline]
+fn log_event<W>(event: &StageEvent<W>)
+where
+    W: Worker,
+{
+    match event {
+        StageEvent::ExecuteOk => trace!("unit executed"),
+        StageEvent::BootstrapError(e, r) => log_stage_error(e, r),
+        StageEvent::NextUnit(_) => trace!("next unit scheduled"),
+        StageEvent::ScheduleError(e, r) => log_stage_error(e, r),
+        StageEvent::ExecuteOk => trace!("work unit executed ok"),
+        StageEvent::ExecuteError(_, e, r) => log_stage_error(e, r),
+        StageEvent::MessagingError => error!("messaging error"),
+        StageEvent::Dismissed => info!("stage dismissed"),
+        StageEvent::BootstrapOk => info!("stage bootstrap ok"),
+        StageEvent::TeardownOk => info!("stage teardown ok"),
+        StageEvent::TeardownError(e, r) => log_stage_error(e, r),
+        StageEvent::WorkerIdle => trace!("worker is idle"),
+        StageEvent::WorkerDone => trace!("worker is done"),
+    }
 }
 
 impl<W> StageMachine<W>
@@ -108,9 +160,8 @@ where
 {
     fn new(anchor: Arc<Anchor>, worker: W, policy: Policy, name: String) -> Self {
         StageMachine {
-            state: StageState::Bootstrap,
+            state: Some(StageState::Bootstrap(Retry::new())),
             tick_count: Default::default(),
-            idle_count: Default::default(),
             name,
             anchor,
             policy,
@@ -119,181 +170,186 @@ where
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn bootstrap(&mut self) -> StageEvent {
-        let schedule = match self.worker.bootstrap().await {
-            Ok(x) => x,
-            Err(x) => return StageEvent::WorkError(x),
-        };
+    async fn bootstrap(&mut self, retry: Retry) -> StageEvent<W> {
+        if !retry.has_next(&self.policy.bootstrap_retry) {
+            return StageEvent::BootstrapError(Error::MaxRetries, retry);
+        }
 
-        match schedule {
-            WorkSchedule::Done => StageEvent::BootstrapOk,
-            WorkSchedule::Disconnected => StageEvent::MessagingError,
-            WorkSchedule::Unit(mut unit) => {
-                let result = retries::retry_unit(
-                    &mut self.worker,
-                    &mut unit,
-                    &self.policy.bootstrap_retry,
-                    Some(&self.anchor.dismissed),
-                )
-                .await;
+        retry
+            .wait_backoff(
+                &self.policy.bootstrap_retry,
+                self.anchor.dismissed_rx.clone(),
+            )
+            .await;
 
-                match result {
-                    Ok(_) => StageEvent::BootstrapOk,
-                    Err(err) => StageEvent::BootstrapError(err),
-                }
-            }
-            _ => unreachable!(),
+        match self.worker.bootstrap().await {
+            Ok(_) => StageEvent::BootstrapOk,
+            Err(x) => return StageEvent::BootstrapError(x, retry),
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn work(&mut self) -> StageEvent {
+    async fn schedule(&mut self, retry: Retry) -> StageEvent<W> {
+        if !retry.has_next(&self.policy.work_retry) {
+            return StageEvent::ScheduleError(Error::MaxRetries, retry);
+        }
+
+        retry
+            .wait_backoff(
+                &self.policy.teardown_retry,
+                self.anchor.dismissed_rx.clone(),
+            )
+            .await;
+
         let schedule = match self.worker.schedule().await {
             Ok(x) => x,
-            Err(x) => return StageEvent::WorkError(x),
+            Err(x) => return StageEvent::ScheduleError(x, retry),
         };
 
         match schedule {
-            WorkSchedule::Idle => StageEvent::WorkIdle,
-            WorkSchedule::Done => StageEvent::WorkDone,
-            WorkSchedule::Disconnected => StageEvent::MessagingError,
-            WorkSchedule::Unit(mut unit) => {
-                let result = retries::retry_unit(
-                    &mut self.worker,
-                    &mut unit,
-                    &self.policy.work_retry,
-                    Some(&self.anchor.dismissed),
-                )
-                .await;
-
-                match result {
-                    Ok(_) => StageEvent::WorkPartial,
-                    Err(err) => StageEvent::WorkError(err),
-                }
-            }
+            WorkSchedule::Idle => StageEvent::WorkerIdle,
+            WorkSchedule::Done => StageEvent::WorkerDone,
+            WorkSchedule::Unit(u) => StageEvent::NextUnit(u),
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn teardown(&mut self) -> StageEvent {
-        let schedule = match self.worker.teardown().await {
-            Ok(x) => x,
-            Err(x) => return StageEvent::WorkError(x),
-        };
+    async fn execute(&mut self, mut unit: W::WorkUnit, retry: Retry) -> StageEvent<W> {
+        if !retry.has_next(&self.policy.work_retry) {
+            return StageEvent::ExecuteError(unit, Error::MaxRetries, retry);
+        }
 
-        match schedule {
-            WorkSchedule::Done => StageEvent::TeardownOk,
-            WorkSchedule::Disconnected => StageEvent::MessagingError,
-            WorkSchedule::Unit(mut unit) => {
-                let result = retries::retry_unit(
-                    &mut self.worker,
-                    &mut unit,
-                    &self.policy.bootstrap_retry,
-                    Some(&self.anchor.dismissed),
-                )
-                .await;
+        retry
+            .wait_backoff(
+                &self.policy.teardown_retry,
+                self.anchor.dismissed_rx.clone(),
+            )
+            .await;
 
-                match result {
-                    Ok(_) => StageEvent::TeardownOk,
-                    Err(err) => StageEvent::TeardownError,
-                }
+        match self.worker.execute(&mut unit).await {
+            Ok(_) => StageEvent::ExecuteOk,
+            Err(err) => StageEvent::ExecuteError(unit, err, retry),
+        }
+    }
+
+    #[instrument(level = Level::INFO, skip_all)]
+    async fn teardown(&mut self, retry: Retry) -> StageEvent<W> {
+        if !retry.has_next(&self.policy.teardown_retry) {
+            return StageEvent::TeardownError(Error::MaxRetries, retry);
+        }
+
+        retry
+            .wait_backoff(
+                &self.policy.teardown_retry,
+                self.anchor.dismissed_rx.clone(),
+            )
+            .await;
+
+        match self.worker.teardown().await {
+            Ok(_) => StageEvent::TeardownOk,
+            Err(x) => return StageEvent::TeardownError(x, retry.clone()),
+        }
+    }
+
+    async fn actuate(&mut self, prev_state: StageState<W>) -> StageEvent<W> {
+        {
+            // if stage is dismissed, return early
+            let is_dismissed = self.anchor.dismissed_rx.borrow();
+            if !matches!(prev_state, StageState::Teardown(_)) && *is_dismissed {
+                return StageEvent::Dismissed;
             }
-            _ => unreachable!(),
+        }
+
+        match prev_state {
+            StageState::Bootstrap(retry) => self.bootstrap(retry).await,
+            StageState::Scheduling(retry) => self.schedule(retry).await,
+            StageState::Executing(unit, retry) => self.execute(unit, retry).await,
+            StageState::Teardown(retry) => self.teardown(retry).await,
+            StageState::Ended => unreachable!("ended stage shouldn't actuate"),
         }
     }
 
-    async fn actuate(&mut self) -> StageEvent {
-        // if stage is dismissed, return early
-        let is_dismissed = self.anchor.dismissed.load();
-        if self.state != StageState::Teardown && is_dismissed {
-            return StageEvent::Dismissed;
-        }
-
-        match self.state {
-            StageState::Bootstrap => self.bootstrap().await,
-            StageState::Idle | StageState::Working => self.work().await,
-            StageState::StandBy => StageEvent::StandBy,
-            StageState::Teardown => self.teardown().await,
+    fn apply(&self, event: StageEvent<W>) -> StageState<W> {
+        match event {
+            StageEvent::BootstrapOk => StageState::Scheduling(Retry::new()),
+            StageEvent::BootstrapError(err, retry) => match err {
+                Error::ShouldRestart => StageState::Bootstrap(retry.next()),
+                Error::RetryableError => StageState::Bootstrap(retry.next()),
+                Error::DismissableError => StageState::Scheduling(Retry::new()),
+                _ => StageState::Teardown(Retry::new()),
+            },
+            StageEvent::NextUnit(u) => StageState::Executing(u, Retry::new()),
+            StageEvent::WorkerIdle => StageState::Scheduling(Retry::new()),
+            StageEvent::ScheduleError(err, retry) => match err {
+                Error::ShouldRestart => StageState::Bootstrap(Retry::new()),
+                Error::RetryableError => StageState::Scheduling(retry.next()),
+                Error::DismissableError => StageState::Scheduling(Retry::new()),
+                _ => StageState::Teardown(Retry::new()),
+            },
+            StageEvent::ExecuteOk => StageState::Scheduling(Retry::new()),
+            StageEvent::ExecuteError(unit, err, retry) => match err {
+                Error::RetryableError => StageState::Executing(unit, retry.next()),
+                Error::DismissableError => StageState::Scheduling(Retry::new()),
+                Error::ShouldRestart => StageState::Bootstrap(Retry::new()),
+                _ => StageState::Teardown(Retry::new()),
+            },
+            StageEvent::WorkerDone => StageState::Teardown(Retry::new()),
+            StageEvent::MessagingError => StageState::Teardown(Retry::new()),
+            StageEvent::Dismissed => StageState::Teardown(Retry::new()),
+            StageEvent::TeardownOk => StageState::Ended,
+            StageEvent::TeardownError(err, retry) => match err {
+                Error::RetryableError => StageState::Teardown(retry.next()),
+                _ => StageState::Ended,
+            },
         }
     }
 
-    fn report(&self, event: &StageEvent, next_state: StageState) {
-        self.anchor.last_state.store(next_state);
+    async fn transition(&mut self) -> StagePhase {
+        let prev_state = self.state.take().unwrap();
+        let prev_phase = StagePhase::from(&prev_state);
+
+        if prev_phase == StagePhase::Ended {
+            self.state = Some(prev_state);
+            return StagePhase::Ended;
+        }
+
+        let event = self.actuate(prev_state).await;
+        log_event(&event);
+
+        let next_state = self.apply(event);
+        let next_phase = StagePhase::from(&next_state);
+
+        if prev_phase != next_phase {
+            info!(?prev_phase, ?next_phase, "switching stage phase");
+        }
+
+        self.state = Some(next_state);
+        self.tick_count.inc(1);
+        self.anchor.last_state.store(next_phase);
         self.anchor.last_tick.store(Instant::now());
 
-        match event {
-            StageEvent::WorkPartial => {
-                self.tick_count.inc(1);
-                trace!("partial work done");
-            }
-            StageEvent::WorkIdle => {
-                self.idle_count.inc(1);
-                trace!("work is idle");
-            }
-            StageEvent::BootstrapError(x) => log_stage_error(x),
-            StageEvent::WorkError(x) => log_stage_error(x),
-            StageEvent::MessagingError => error!("messaging error"),
-            StageEvent::Dismissed => info!("stage dismissed"),
-            StageEvent::WorkDone => info!("stage work done"),
-            StageEvent::BootstrapOk => info!("stage bootstrap ok"),
-            StageEvent::TeardownOk => info!("stage teardown ok"),
-            StageEvent::TeardownError => error!("stage teardown error"),
-            StageEvent::StandBy => (),
-        }
-
-        if self.state != next_state {
-            info!(next = ?next_state, "switching state");
-        }
-    }
-
-    fn apply(&mut self, event: &StageEvent) -> Option<StageState> {
-        match event {
-            StageEvent::Dismissed => Some(StageState::Teardown),
-            StageEvent::WorkPartial => Some(StageState::Working),
-            StageEvent::WorkIdle => Some(StageState::Idle),
-            StageEvent::WorkDone => Some(StageState::StandBy),
-            StageEvent::WorkError(Error::ShouldRestart) => Some(StageState::Bootstrap),
-            StageEvent::WorkError(Error::DismissableError) => Some(StageState::Working),
-            StageEvent::WorkError(Error::RecvIdle) => Some(StageState::Idle),
-            StageEvent::WorkError(_) => Some(StageState::StandBy),
-            StageEvent::MessagingError => Some(StageState::StandBy),
-            StageEvent::BootstrapOk => Some(StageState::Working),
-            StageEvent::BootstrapError(_) => Some(StageState::StandBy),
-            StageEvent::StandBy => Some(StageState::StandBy),
-            StageEvent::TeardownOk => None,
-            StageEvent::TeardownError => None,
-        }
-    }
-
-    async fn transition(&mut self) -> Option<StageState> {
-        let event = self.actuate().await;
-        let next = self.apply(&event);
-
-        match next {
-            Some(next_state) => {
-                self.report(&event, next_state);
-                self.state = next_state;
-                Some(next_state)
-            }
-            None => None,
-        }
+        next_phase
     }
 }
 
 /// Sentinel object that lives within the thread of the stage
 pub struct Anchor {
-    dismissed: AtomicCell<bool>,
-    last_state: AtomicCell<StageState>,
+    dismissed_rx: tokio::sync::watch::Receiver<bool>,
+    dismissed_tx: tokio::sync::watch::Sender<bool>,
+    last_state: AtomicCell<StagePhase>,
     last_tick: AtomicCell<Instant>,
     metrics: metrics::Registry,
 }
 
 impl Anchor {
     fn new(metrics: metrics::Registry) -> Self {
+        let (dismissed_tx, dismissed_rx) = tokio::sync::watch::channel(false);
+
         Self {
-            dismissed: AtomicCell::new(false),
+            dismissed_rx,
+            dismissed_tx,
             last_tick: AtomicCell::new(Instant::now()),
-            last_state: AtomicCell::new(StageState::Bootstrap),
+            last_state: AtomicCell::new(StagePhase::Bootstrap),
             metrics,
         }
     }
@@ -309,8 +365,8 @@ pub struct Tether {
 #[derive(Debug, PartialEq)]
 pub enum TetherState {
     Dropped,
-    Blocked(StageState),
-    Alive(StageState),
+    Blocked(StagePhase),
+    Alive(StagePhase),
 }
 
 impl Tether {
@@ -333,7 +389,7 @@ impl Tether {
 
     pub fn dismiss_stage(&self) -> Result<(), Error> {
         let anchor = self.try_anchor()?;
-        anchor.dismissed.store(true);
+        anchor.dismissed_tx.send(true);
 
         Ok(())
     }
@@ -346,18 +402,18 @@ impl Tether {
         }
 
         let anchor = anchor.unwrap();
-
-        let last_state = anchor.last_state.load();
+        let last_phase = anchor.last_state.load();
 
         if let Some(timeout) = &self.policy.tick_timeout {
             let last_tick = anchor.last_tick.load();
+
             if last_tick.elapsed() > *timeout {
-                TetherState::Blocked(last_state)
+                TetherState::Blocked(last_phase)
             } else {
-                TetherState::Alive(last_state)
+                TetherState::Alive(last_phase)
             }
         } else {
-            TetherState::Alive(last_state)
+            TetherState::Alive(last_phase)
         }
     }
 
@@ -406,7 +462,7 @@ where
         .build()
         .unwrap();
 
-    rt.block_on(async { while let Some(_) = machine.transition().await {} });
+    rt.block_on(async { while machine.transition().await != StagePhase::Ended {} });
 }
 
 pub fn spawn_stage<W>(worker: W, policy: Policy, name: Option<&str>) -> Tether

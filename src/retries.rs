@@ -3,14 +3,57 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::{atomic::AtomicCell, utils::Backoff};
 use tracing::{debug, warn};
 
-use crate::{error::Error, runtime::Worker};
+use crate::error::Error;
+
+#[derive(Clone, Debug)]
+pub struct Retry(Option<usize>);
+
+impl Retry {
+    pub fn new() -> Self {
+        Self(None)
+    }
+
+    pub fn next(&self) -> Self {
+        Self(Some(self.0.unwrap_or(0) + 1))
+    }
+
+    pub fn has_next(&self, policy: &Policy) -> bool {
+        match &self.0 {
+            Some(num) => *num <= policy.max_retries,
+            None => true,
+        }
+    }
+
+    pub async fn wait_backoff(
+        &self,
+        policy: &Policy,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let num = match &self.0 {
+            Some(x) => x,
+            None => return,
+        };
+
+        let backoff = compute_backoff_delay(policy, *num);
+
+        debug!(
+            "backoff for {}s until next retry #{}",
+            backoff.as_secs(),
+            num
+        );
+
+        tokio::select! {
+            _ = cancel.changed() => (),
+            _ = tokio::time::sleep(backoff) => ()
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Policy {
-    pub max_retries: u32,
+    pub max_retries: usize,
     pub backoff_unit: Duration,
     pub backoff_factor: u32,
     pub max_backoff: Duration,
@@ -27,70 +70,10 @@ impl Policy {
     }
 }
 
-fn compute_backoff_delay(policy: &Policy, retry: u32) -> Duration {
-    let units = policy.backoff_factor.pow(retry);
+fn compute_backoff_delay(policy: &Policy, retry: usize) -> Duration {
+    let units = policy.backoff_factor.pow(retry as u32);
     let backoff = policy.backoff_unit.mul(units);
     core::cmp::min(backoff, policy.max_backoff)
-}
-
-#[inline]
-fn should_cancel(flag: Option<&AtomicCell<bool>>) -> bool {
-    match flag {
-        Some(cancel) => cancel.load(),
-        None => false,
-    }
-}
-
-pub fn sleep_except_cancel(duration: Duration, cancel: Option<&AtomicCell<bool>>) {
-    let start = Instant::now();
-    let snoozer = Backoff::new();
-
-    while !should_cancel(cancel) && start.elapsed() <= duration {
-        snoozer.snooze();
-    }
-}
-
-pub async fn retry_unit<W>(
-    worker: &mut W,
-    unit: &mut W::WorkUnit,
-    policy: &Policy,
-    cancel: Option<&AtomicCell<bool>>,
-) -> Result<(), Error>
-where
-    W: Worker,
-{
-    let mut retry = 0;
-
-    loop {
-        if should_cancel(cancel) {
-            break Err(Error::Cancelled);
-        }
-
-        let result = worker.execute(unit).await;
-
-        match result {
-            Err(Error::RetryableError) if retry < policy.max_retries => {
-                warn!("retryable operation error");
-
-                retry += 1;
-
-                let backoff = compute_backoff_delay(policy, retry);
-
-                debug!(
-                    "backoff for {}s until next retry #{}",
-                    backoff.as_secs(),
-                    retry
-                );
-
-                sleep_except_cancel(backoff, cancel);
-            }
-            Err(Error::RetryableError) => {
-                warn!("max retries reached");
-                break Err(Error::RetryableError);
-            }
-            x => break x,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -39,7 +39,7 @@ impl Worker for Ticker {
         Ok(WorkSchedule::Unit(unit))
     }
 
-    async fn execute(&mut self, unit: &mut Self::WorkUnit) -> Result<(), Error> {
+    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
         tokio::time::sleep(Duration::from_secs(unit.delay)).await;
         self.output.send(unit.instant.into()).await?;
 
@@ -66,7 +66,7 @@ impl Worker for Terminal {
         Ok(WorkSchedule::Unit(msg.payload))
     }
 
-    async fn execute(&mut self, unit: &mut Self::WorkUnit) -> Result<(), Error> {
+    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
         println!("{:?}", unit.elapsed());
 
         Ok(())

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, marker::PhantomData, time::Duration};
+use std::{collections::VecDeque, marker::PhantomData};
 
 use crate::error::Error;
 
@@ -131,7 +131,6 @@ where
 
 pub trait RecvAdapter<P>: Send + Sync {
     async fn recv(&mut self) -> Result<Message<P>, Error>;
-    fn try_recv(&mut self) -> Result<Message<P>, Error>;
 }
 
 pub trait RecvPort<A, P>
@@ -183,14 +182,6 @@ where
     pub async fn recv(&mut self) -> Result<Message<P>, Error> {
         let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
         let msg = receiver.recv().await?;
-        self.counter += 1;
-
-        Ok(msg)
-    }
-
-    pub fn try_recv(&mut self) -> Result<Message<P>, Error> {
-        let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
-        let msg = receiver.try_recv()?;
         self.counter += 1;
 
         Ok(msg)
@@ -280,7 +271,7 @@ where
 pub mod tokio {
     use super::*;
 
-    use ::tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender};
+    use ::tokio::sync::mpsc::{Receiver, Sender};
 
     pub struct ChannelSendAdapter<P>(Sender<Message<P>>);
 
@@ -310,13 +301,6 @@ pub mod tokio {
                 Some(x) => Ok(x),
                 None => Err(Error::RecvError),
             }
-        }
-
-        fn try_recv(&mut self) -> Result<Message<P>, Error> {
-            self.0.try_recv().map_err(|err| match err {
-                TryRecvError::Empty => Error::RecvIdle,
-                TryRecvError::Disconnected => Error::RecvError,
-            })
         }
     }
 

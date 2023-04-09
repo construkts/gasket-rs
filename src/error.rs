@@ -17,11 +17,11 @@ pub enum Error {
     #[error("error receiving work unit through input port")]
     RecvError,
 
-    #[error("input port is idle")]
-    RecvIdle,
-
     #[error("stage panic, stopping all work")]
     WorkPanic,
+
+    #[error("max retries reached")]
+    MaxRetries,
 
     #[error("error that requires stage to restart")]
     ShouldRestart,
