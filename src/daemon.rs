@@ -2,15 +2,15 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::runtime::{StageState, Tether, TetherState};
+use crate::runtime::{StagePhase, StageState, Tether, TetherState};
 
 pub struct Daemon(pub Vec<Tether>);
 
 impl Daemon {
     fn should_stop(&self) -> bool {
         self.0.iter().any(|tether| match tether.check_state() {
-            TetherState::Alive(x) => {
-                matches!(x, StageState::StandBy)
+            TetherState::Alive(p) => {
+                matches!(p, StagePhase::Ended)
             }
             _ => true,
         })

@@ -1,51 +1,75 @@
+#![feature(async_fn_in_trait)]
+
 use std::time::{Duration, Instant};
 
 use gasket::{
-    messaging::crossbeam::{connect_ports, InputPort, OutputPort, TwoPhaseInputPort},
+    error::Error,
+    messaging::tokio::{connect_ports, InputPort, OutputPort},
     metrics::{self, Counter, Registry},
     retries,
-    runtime::{spawn_stage, Policy, WorkOutcome, WorkResult, Worker},
+    runtime::{spawn_stage, Policy, ScheduleResult, WorkSchedule, Worker},
 };
 
 struct Ticker {
     output: OutputPort<Instant>,
-    next_delay: u64,
     value_1: Counter,
+    next_delay: u64,
+}
+
+struct TickerUnit {
+    instant: Instant,
+    delay: u64,
 }
 
 impl Worker for Ticker {
+    type WorkUnit = TickerUnit;
+
     fn metrics(&self) -> Registry {
         metrics::Builder::new()
             .with_counter("value_1", &self.value_1)
             .build()
     }
 
-    fn work(&mut self) -> WorkResult {
-        std::thread::sleep(Duration::from_secs(self.next_delay));
-        let now = Instant::now();
-        self.output.send(now.into())?;
+    async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
+        let unit = TickerUnit {
+            instant: Instant::now(),
+            delay: self.next_delay,
+        };
+
+        Ok(WorkSchedule::Unit(unit))
+    }
+
+    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
+        tokio::time::sleep(Duration::from_secs(unit.delay)).await;
+        self.output.send(unit.instant.into()).await?;
+
         self.value_1.inc(3);
         self.next_delay += 1;
 
-        Ok(WorkOutcome::Partial)
+        Ok(())
     }
 }
 
 struct Terminal {
-    input: TwoPhaseInputPort<Instant>,
+    input: InputPort<Instant>,
 }
 
 impl Worker for Terminal {
+    type WorkUnit = Instant;
+
     fn metrics(&self) -> Registry {
         metrics::Builder::new().build()
     }
 
-    fn work(&mut self) -> WorkResult {
-        let unit = self.input.recv()?;
-        println!("{:?}", unit.payload);
+    async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
+        let msg = self.input.recv().await?;
+        Ok(WorkSchedule::Unit(msg.payload))
+    }
 
-        self.input.commit();
-        Ok(WorkOutcome::Partial)
+    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
+        println!("{:?}", unit.elapsed());
+
+        Ok(())
     }
 }
 
