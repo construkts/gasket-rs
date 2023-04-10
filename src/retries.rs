@@ -1,11 +1,6 @@
-use std::{
-    ops::Mul,
-    time::{Duration, Instant},
-};
+use std::{ops::Mul, time::Duration};
 
-use tracing::{debug, warn};
-
-use crate::error::Error;
+use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub struct Retry(Option<usize>);

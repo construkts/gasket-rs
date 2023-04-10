@@ -24,6 +24,7 @@ where
     }
 }
 
+#[async_trait::async_trait]
 pub trait SendAdapter<P>: Send + Sync {
     async fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
 }
@@ -129,6 +130,7 @@ where
     }
 }
 
+#[async_trait::async_trait]
 pub trait RecvAdapter<P>: Send + Sync {
     async fn recv(&mut self) -> Result<Message<P>, Error>;
 }
@@ -202,6 +204,7 @@ pub struct SinkAdapter<P> {
     buffer: VecDeque<Message<P>>,
 }
 
+#[async_trait::async_trait]
 impl<P> SendAdapter<P> for SinkAdapter<P>
 where
     P: Send + Sync,
@@ -253,9 +256,12 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl<I, F, T> SendAdapter<F> for MapSendAdapter<I, F, T>
 where
-    I: SendAdapter<T>,
+    I: SendAdapter<T> + Send,
+    F: Send,
+    T: Send,
 {
     async fn send(&mut self, msg: Message<F>) -> Result<(), Error> {
         let out = (self.mapper)(msg.payload);
@@ -281,6 +287,7 @@ pub mod tokio {
         }
     }
 
+    #[async_trait::async_trait]
     impl<P> SendAdapter<P> for ChannelSendAdapter<P>
     where
         P: Send + Sync,
@@ -292,6 +299,7 @@ pub mod tokio {
 
     pub struct ChannelRecvAdapter<P>(Receiver<Message<P>>);
 
+    #[async_trait::async_trait]
     impl<P> RecvAdapter<P> for ChannelRecvAdapter<P>
     where
         P: Send + Sync,

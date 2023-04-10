@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::runtime::{StagePhase, StageState, Tether, TetherState};
+use crate::runtime::{StagePhase, Tether, TetherState};
 
 pub struct Daemon(pub Vec<Tether>);
 
