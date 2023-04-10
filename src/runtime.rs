@@ -1,12 +1,11 @@
 use std::{
-    ops::{Deref, DerefMut},
     sync::{Arc, Weak},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
-use tracing::{debug, error, info, instrument, trace, warn, Level};
+use tracing::{error, info, instrument, trace, warn, Level};
 
 use crate::retries;
 use crate::{error::Error, metrics};
@@ -26,6 +25,7 @@ pub enum WorkSchedule<U> {
 
 pub type ScheduleResult<U> = Result<WorkSchedule<U>, Error>;
 
+#[async_trait::async_trait]
 pub trait Worker: Send {
     type WorkUnit: Sized;
 
@@ -142,7 +142,6 @@ where
         StageEvent::BootstrapError(e, r) => log_stage_error(e, r),
         StageEvent::NextUnit(_) => trace!("next unit scheduled"),
         StageEvent::ScheduleError(e, r) => log_stage_error(e, r),
-        StageEvent::ExecuteOk => trace!("work unit executed ok"),
         StageEvent::ExecuteError(_, e, r) => log_stage_error(e, r),
         StageEvent::MessagingError => error!("messaging error"),
         StageEvent::Dismissed => info!("stage dismissed"),
@@ -389,7 +388,10 @@ impl Tether {
 
     pub fn dismiss_stage(&self) -> Result<(), Error> {
         let anchor = self.try_anchor()?;
-        anchor.dismissed_tx.send(true);
+        anchor
+            .dismissed_tx
+            .send(true)
+            .map_err(|_| Error::TetherDropped)?;
 
         Ok(())
     }
