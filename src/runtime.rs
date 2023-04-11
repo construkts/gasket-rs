@@ -25,7 +25,7 @@ pub enum WorkSchedule<U> {
 
 pub type ScheduleResult<U> = Result<WorkSchedule<U>, Error>;
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait Worker: Send {
     type WorkUnit: Sized;
 
