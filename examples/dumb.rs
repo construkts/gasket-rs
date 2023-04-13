@@ -1,5 +1,3 @@
-#![feature(async_fn_in_trait)]
-
 use std::time::{Duration, Instant};
 
 use gasket::{
@@ -21,6 +19,7 @@ struct TickerUnit {
     delay: u64,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Worker for Ticker {
     type WorkUnit = TickerUnit;
 
@@ -54,6 +53,7 @@ struct Terminal {
     input: InputPort<Instant>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Worker for Terminal {
     type WorkUnit = Instant;
 

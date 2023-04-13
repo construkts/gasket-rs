@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::{ops::Mul, time::Duration};
-
 use tracing::debug;
+
+use crate::error::Error;
 
 #[derive(Clone, Debug)]
 pub struct Retry(Option<usize>);
@@ -14,10 +16,18 @@ impl Retry {
         Self(Some(self.0.unwrap_or(0) + 1))
     }
 
-    pub fn has_next(&self, policy: &Policy) -> bool {
+    pub fn is_valid(&self, policy: &Policy) -> bool {
         match &self.0 {
             Some(num) => *num <= policy.max_retries,
             None => true,
+        }
+    }
+
+    pub fn ok(&self, policy: &Policy) -> Result<(), Error> {
+        match (self.is_valid(policy), policy.dismissible) {
+            (true, _) => Ok(()),
+            (false, true) => Err(Error::DismissableError),
+            (false, false) => Err(Error::MaxRetries),
         }
     }
 
@@ -46,21 +56,23 @@ impl Retry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize, Default)]
 pub struct Policy {
     pub max_retries: usize,
     pub backoff_unit: Duration,
     pub backoff_factor: u32,
     pub max_backoff: Duration,
+    pub dismissible: bool,
 }
 
 impl Policy {
     pub fn no_retry() -> Self {
         Self {
             max_retries: 0,
-            backoff_unit: Duration::from_secs(1),
-            backoff_factor: 2,
-            max_backoff: Duration::from_secs(60),
+            backoff_unit: Default::default(),
+            backoff_factor: Default::default(),
+            max_backoff: Default::default(),
+            dismissible: Default::default(),
         }
     }
 }
