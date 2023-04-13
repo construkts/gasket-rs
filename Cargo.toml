@@ -2,8 +2,14 @@
 name = "gasket"
 version = "0.2.0"
 edition = "2021"
+description = "Staged Event-Driven Architecture (SEDA) framework"
+repository = "https://github.com/construkts/gasket-rs"
+homepage = "https://github.com/construkts/gasket-rs"
+documentation = "https://docs.rs/gasket"
+license = "Apache-2.0"
+readme = "README.md"
+authors = ["Santiago Carmuega <santiago@carmuega.me>"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 async-trait = "0.1.68"
