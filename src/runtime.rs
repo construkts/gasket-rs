@@ -170,7 +170,7 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn bootstrap(&mut self, retry: Retry) -> StageEvent<W> {
-        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+        if let Err(err) = retry.ok(&self.policy.bootstrap_retry) {
             return StageEvent::BootstrapError(err, retry);
         }
 
@@ -189,7 +189,7 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn schedule(&mut self, retry: Retry) -> StageEvent<W> {
-        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+        if let Err(err) = retry.ok(&self.policy.work_retry) {
             return StageEvent::ScheduleError(err, retry);
         }
 
@@ -214,7 +214,7 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn execute(&mut self, mut unit: W::WorkUnit, retry: Retry) -> StageEvent<W> {
-        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+        if let Err(err) = retry.ok(&self.policy.work_retry) {
             return StageEvent::ExecuteError(unit, err, retry);
         }
 
@@ -341,6 +341,10 @@ pub struct Anchor {
 }
 
 impl Anchor {
+    fn for_worker(worker: &impl Worker) -> Self {
+        Self::new(worker.metrics())
+    }
+
     fn new(metrics: metrics::Registry) -> Self {
         let (dismissed_tx, dismissed_rx) = tokio::sync::watch::channel(false);
 
@@ -351,6 +355,14 @@ impl Anchor {
             last_state: AtomicCell::new(StagePhase::Bootstrap),
             metrics,
         }
+    }
+
+    fn dismiss_stage(&self) -> Result<(), Error> {
+        self.dismissed_tx
+            .send(true)
+            .map_err(|_| Error::TetherDropped)?;
+
+        Ok(())
     }
 }
 
@@ -388,12 +400,7 @@ impl Tether {
 
     pub fn dismiss_stage(&self) -> Result<(), Error> {
         let anchor = self.try_anchor()?;
-        anchor
-            .dismissed_tx
-            .send(true)
-            .map_err(|_| Error::TetherDropped)?;
-
-        Ok(())
+        anchor.dismiss_stage()
     }
 
     pub fn check_state(&self) -> TetherState {
@@ -474,8 +481,7 @@ where
     let name = name
         .map(|x| x.to_owned())
         .unwrap_or("un-named stage".into());
-    let metrics = worker.metrics();
-    let anchor = Arc::new(Anchor::new(metrics));
+    let anchor = Arc::new(Anchor::for_worker(&worker));
     let anchor_ref = Arc::downgrade(&anchor);
 
     let name2 = name.clone();
@@ -491,4 +497,207 @@ where
         thread_handle,
         policy,
     }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct MockWorker {
+        bootstrap_count: usize,
+        schedule_count: usize,
+        execute_count: usize,
+        teardown_count: usize,
+        failures: Vec<bool>,
+    }
+
+    impl MockWorker {
+        fn should_fail(&self, unit: usize) -> bool {
+            if self.failures.is_empty() {
+                return false;
+            }
+
+            let failure_idx = unit % self.failures.len();
+            *self.failures.get(failure_idx).unwrap()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Worker for MockWorker {
+        type WorkUnit = usize;
+
+        fn metrics(&self) -> metrics::Registry {
+            metrics::Registry::new()
+        }
+
+        async fn bootstrap(&mut self) -> Result<(), Error> {
+            self.bootstrap_count += 1;
+
+            Ok(())
+        }
+
+        async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
+            self.schedule_count += 1;
+
+            Ok(WorkSchedule::Unit(self.schedule_count))
+        }
+
+        async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
+            self.execute_count += 1;
+
+            match self.should_fail(*unit) {
+                true => Err(Error::RetryableError),
+                false => Ok(()),
+            }
+        }
+
+        async fn teardown(&mut self) -> Result<(), Error> {
+            self.teardown_count += 1;
+
+            Ok(())
+        }
+    }
+
+    async fn should_teardown_and_end(machine: &mut StageMachine<MockWorker>) {
+        assert!(matches!(machine.state, Some(StageState::Teardown(_))));
+        machine.transition().await;
+        assert_eq!(machine.worker.teardown_count, 1);
+        assert!(matches!(machine.state, Some(StageState::Ended)));
+    }
+
+    async fn should_bootstrap(machine: &mut StageMachine<MockWorker>) {
+        assert!(matches!(machine.state, Some(StageState::Bootstrap(_))));
+        machine.transition().await;
+        assert_eq!(machine.worker.bootstrap_count, 1);
+    }
+
+    #[tokio::test]
+    async fn stage_machine_happy_path() {
+        let worker = MockWorker::default();
+        let anchor = Arc::new(Anchor::for_worker(&worker));
+        let policy = Policy::default();
+
+        let mut machine = StageMachine::new(anchor, worker, policy, "dummy".into());
+
+        should_bootstrap(&mut machine).await;
+
+        for _ in 0..5 {
+            assert!(matches!(machine.state, Some(StageState::Scheduling(_))));
+            machine.transition().await;
+            assert!(matches!(machine.state, Some(StageState::Executing(_, _))));
+            machine.transition().await;
+        }
+
+        assert_eq!(machine.worker.execute_count, 5);
+
+        machine.anchor.dismiss_stage().unwrap();
+        machine.transition().await;
+
+        should_teardown_and_end(&mut machine).await;
+    }
+
+    #[tokio::test]
+    async fn honors_max_retries() {
+        let worker = MockWorker {
+            failures: vec![true],
+            ..Default::default()
+        };
+        let anchor = Arc::new(Anchor::for_worker(&worker));
+
+        let work_retry = super::retries::Policy {
+            max_retries: 3,
+            ..Default::default()
+        };
+
+        let mut machine = StageMachine::new(
+            anchor,
+            worker,
+            Policy {
+                work_retry,
+                ..Default::default()
+            },
+            "dummy".into(),
+        );
+
+        should_bootstrap(&mut machine).await;
+
+        assert!(matches!(machine.state, Some(StageState::Scheduling(_))));
+        machine.transition().await;
+
+        for _ in 0..5 {
+            match machine.state {
+                Some(StageState::Executing(unit, _)) => {
+                    // should repeat the same unit every loop
+                    assert_eq!(unit, 1);
+                }
+                _ => panic!("unexpected state"),
+            }
+            machine.transition().await;
+        }
+
+        assert_eq!(machine.worker.execute_count, 4);
+
+        should_teardown_and_end(&mut machine).await;
+    }
+
+    // #[tokio::test]
+    // async fn honors_exponential_backoff() {
+    //     let mut u1 = FailingUnit {
+    //         attempt: 0,
+    //         delay: None,
+    //     };
+
+    //     let policy = Policy {
+    //         max_retries: 10,
+    //         backoff_unit: Duration::from_millis(1),
+    //         backoff_factor: 2,
+    //         max_backoff: Duration::MAX,
+    //     };
+
+    //     let start = std::time::Instant::now();
+    //     let cancel = AtomicCell::new(false);
+
+    //     let result = retry_unit(&mut u1, &policy, Some(&cancel)).await;
+    //     let elapsed = start.elapsed();
+
+    //     assert!(result.is_err());
+
+    //     // not an exact science, should be 2046, adding +/- 10%
+    //     assert!(elapsed.as_millis() >= 1842);
+    //     assert!(elapsed.as_millis() <= 2250);
+    // }
+
+    // #[tokio::test]
+    // async fn honors_cancel() {
+    //     let mut u1 = FailingUnit {
+    //         attempt: 0,
+    //         delay: None,
+    //     };
+
+    //     let policy = Policy {
+    //         max_retries: 100,
+    //         backoff_unit: Duration::from_millis(2000),
+    //         backoff_factor: 2,
+    //         max_backoff: Duration::MAX,
+    //     };
+
+    //     let start = std::time::Instant::now();
+    //     let cancel = Arc::new(AtomicCell::new(false));
+
+    //     let cancel2 = cancel.clone();
+    //     std::thread::spawn(move || {
+    //         std::thread::sleep(Duration::from_millis(500));
+    //         cancel2.store(true);
+    //     });
+
+    //     let result = retry_unit(&mut u1, &policy, Some(&cancel)).await;
+    //     let elapsed = start.elapsed();
+
+    //     assert!(result.is_err());
+
+    //     // not an exact science, should be 2046, adding +/- 10%
+    //     assert!(elapsed.as_millis() >= 450);
+    //     assert!(elapsed.as_millis() <= 550);
+    // }
 }
