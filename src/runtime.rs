@@ -170,8 +170,8 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn bootstrap(&mut self, retry: Retry) -> StageEvent<W> {
-        if !retry.has_next(&self.policy.bootstrap_retry) {
-            return StageEvent::BootstrapError(Error::MaxRetries, retry);
+        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+            return StageEvent::BootstrapError(err, retry);
         }
 
         retry
@@ -189,8 +189,8 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn schedule(&mut self, retry: Retry) -> StageEvent<W> {
-        if !retry.has_next(&self.policy.work_retry) {
-            return StageEvent::ScheduleError(Error::MaxRetries, retry);
+        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+            return StageEvent::ScheduleError(err, retry);
         }
 
         retry
@@ -214,8 +214,8 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn execute(&mut self, mut unit: W::WorkUnit, retry: Retry) -> StageEvent<W> {
-        if !retry.has_next(&self.policy.work_retry) {
-            return StageEvent::ExecuteError(unit, Error::MaxRetries, retry);
+        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+            return StageEvent::ExecuteError(unit, err, retry);
         }
 
         retry
@@ -233,8 +233,8 @@ where
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn teardown(&mut self, retry: Retry) -> StageEvent<W> {
-        if !retry.has_next(&self.policy.teardown_retry) {
-            return StageEvent::TeardownError(Error::MaxRetries, retry);
+        if let Err(err) = retry.ok(&self.policy.teardown_retry) {
+            return StageEvent::TeardownError(err, retry);
         }
 
         retry
