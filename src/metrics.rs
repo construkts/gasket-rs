@@ -1,7 +1,25 @@
 use crossbeam::atomic::AtomicCell;
 use std::{collections::HashMap, sync::Arc};
 
-pub type Registry = HashMap<&'static str, Metric>;
+pub struct Registry(HashMap<&'static str, Metric>);
+
+impl Registry {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    pub fn counter(&mut self, key: &'static str) -> Counter {
+        let metric = self
+            .0
+            .entry(key)
+            .or_insert_with(|| Metric::Counter(Counter::default()));
+
+        match metric {
+            Metric::Counter(x) => x.clone(),
+            _ => unreachable!(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Counter {
@@ -50,6 +68,7 @@ pub type Readings = Vec<(&'static str, Reading)>;
 
 pub fn collect_readings(registry: &Registry) -> Readings {
     registry
+        .0
         .iter()
         .map(|(key, value)| (&**key, value.read()))
         .collect::<Readings>()
@@ -59,12 +78,12 @@ pub struct Builder(Registry);
 
 impl Builder {
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self(Registry(HashMap::new()))
     }
 
     fn with_metric(self, key: &'static str, metric: Metric) -> Self {
         let Builder(mut metrics) = self;
-        metrics.insert(key, metric);
+        metrics.0.insert(key, metric);
         Self(metrics)
     }
 

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use gasket::{
     error::Error,
     messaging::tokio::{connect_ports, InputPort, OutputPort},
-    metrics::{self, Counter, Registry},
+    metrics::{self, Counter},
     retries,
     runtime::{spawn_stage, Policy, ScheduleResult, WorkSchedule, Worker},
 };
@@ -22,11 +22,17 @@ struct TickerUnit {
 #[async_trait::async_trait(?Send)]
 impl Worker for Ticker {
     type WorkUnit = TickerUnit;
+    type Config = ();
 
-    fn metrics(&self) -> Registry {
-        metrics::Builder::new()
-            .with_counter("value_1", &self.value_1)
-            .build()
+    async fn bootstrap(
+        config: &Self::Config,
+        metrics: &mut metrics::Registry,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            value_1: metrics.counter("value_1"),
+            output: Default::default(),
+            next_delay: Default::default(),
+        })
     }
 
     async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
@@ -56,11 +62,16 @@ struct Terminal {
 #[async_trait::async_trait(?Send)]
 impl Worker for Terminal {
     type WorkUnit = Instant;
+    type Config = ();
 
-    fn metrics(&self) -> Registry {
-        metrics::Builder::new().build()
+    async fn bootstrap(
+        config: &Self::Config,
+        metrics: &mut metrics::Registry,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            input: Default::default(),
+        })
     }
-
     async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
         let msg = self.input.recv().await?;
         Ok(WorkSchedule::Unit(msg.payload))
@@ -74,6 +85,13 @@ impl Worker for Terminal {
 }
 
 fn main() {
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    )
+    .unwrap();
+
     let mut ticker = Ticker {
         output: Default::default(),
         value_1: Counter::default(),
@@ -86,8 +104,8 @@ fn main() {
 
     connect_ports(&mut ticker.output, &mut terminal.input, 10);
 
-    let tether1 = spawn_stage(
-        ticker,
+    let tether1 = spawn_stage::<Ticker>(
+        (),
         Policy {
             tick_timeout: Some(Duration::from_secs(3)),
             bootstrap_retry: retries::Policy::no_retry(),
@@ -97,8 +115,8 @@ fn main() {
         Some("ticker"),
     );
 
-    let tether2 = spawn_stage(
-        terminal,
+    let tether2 = spawn_stage::<Terminal>(
+        (),
         Policy {
             tick_timeout: None,
             bootstrap_retry: retries::Policy::no_retry(),
