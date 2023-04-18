@@ -8,9 +8,14 @@ use gasket::{
     runtime::{spawn_stage, Policy, ScheduleResult, WorkSchedule, Worker},
 };
 
-struct Ticker {
+#[derive(Clone)]
+struct TickerSpec {
     output: OutputPort<Instant>,
     value_1: Counter,
+}
+
+struct Ticker {
+    spec: TickerSpec,
     next_delay: u64,
 }
 
@@ -22,15 +27,14 @@ struct TickerUnit {
 #[async_trait::async_trait(?Send)]
 impl Worker for Ticker {
     type WorkUnit = TickerUnit;
-    type Config = ();
+    type Config = TickerSpec;
 
     async fn bootstrap(
         config: &Self::Config,
         metrics: &mut metrics::Registry,
     ) -> Result<Self, Error> {
         Ok(Self {
-            value_1: metrics.counter("value_1"),
-            output: Default::default(),
+            spec: config.clone(),
             next_delay: Default::default(),
         })
     }
@@ -46,17 +50,22 @@ impl Worker for Ticker {
 
     async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
         tokio::time::sleep(Duration::from_secs(unit.delay)).await;
-        self.output.send(unit.instant.into()).await?;
+        self.spec.output.send(unit.instant.into()).await?;
 
-        self.value_1.inc(3);
+        self.spec.value_1.inc(3);
         self.next_delay += 1;
 
         Ok(())
     }
 }
 
-struct Terminal {
+#[derive(Clone)]
+struct TerminalSpec {
     input: InputPort<Instant>,
+}
+
+struct Terminal {
+    spec: TerminalSpec,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -92,20 +101,19 @@ fn main() {
     )
     .unwrap();
 
-    let mut ticker = Ticker {
+    let mut ticker = TickerSpec {
         output: Default::default(),
         value_1: Counter::default(),
-        next_delay: 0,
     };
 
-    let mut terminal = Terminal {
+    let mut terminal = TerminalSpec {
         input: Default::default(),
     };
 
     connect_ports(&mut ticker.output, &mut terminal.input, 10);
 
     let tether1 = spawn_stage::<Ticker>(
-        (),
+        ticker,
         Policy {
             tick_timeout: Some(Duration::from_secs(3)),
             bootstrap_retry: retries::Policy::no_retry(),

@@ -7,53 +7,14 @@ use std::{
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
 use tracing::{error, info, instrument, trace, warn, Level};
 
+use crate::metrics;
 use crate::retries;
-use crate::{error::Error, metrics};
 use crate::{
     metrics::{collect_readings, Readings},
     retries::Retry,
 };
 
-pub enum WorkSchedule<U> {
-    /// worker is not doing anything, but might in the future
-    Idle,
-    /// a work unit should be executed
-    Unit(U),
-    /// worker has done all the work it needed
-    Done,
-}
-
-pub type ScheduleResult<U> = Result<WorkSchedule<U>, Error>;
-
-#[async_trait::async_trait(?Send)]
-pub trait Worker: Send + Sized {
-    type WorkUnit: Sized + Send;
-    type Config: Send;
-
-    /// Bootstrap a new worker
-    ///
-    /// It's responsible for initializing any resources needed by the worker.
-    async fn bootstrap(
-        config: &Self::Config,
-        metrics: &mut metrics::Registry,
-    ) -> Result<Self, Error>;
-
-    /// Schedule the next work unit for execution
-    ///
-    /// This usually means reading messages from input ports and returning a
-    /// work unit that contains all data required for execution.
-    async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit>;
-
-    /// Execute the action described by the work unit
-    ///
-    /// This usually means doing required computation, generating side-effect
-    /// and submitting message through the output ports
-    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error>;
-
-    async fn teardown(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
-}
+use crate::framework::*;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum StagePhase {
@@ -68,10 +29,10 @@ pub enum StageState<W>
 where
     W: Worker,
 {
-    Bootstrap(Retry),
+    Bootstrap(W::Config, Retry),
     Scheduling(W, Retry),
     Executing(W, W::WorkUnit, Retry),
-    Teardown(W, Retry),
+    Teardown(W, Retry, Ended),
     Ended,
 }
 
@@ -97,7 +58,7 @@ where
 {
     fn from(value: &StageState<W>) -> Self {
         match value {
-            StageState::Bootstrap(_) => Self::Bootstrap,
+            StageState::Bootstrap(..) => Self::Bootstrap,
             StageState::Scheduling(..) => Self::Working,
             StageState::Executing(..) => Self::Working,
             StageState::Teardown(..) => Self::Teardown,
@@ -105,6 +66,8 @@ where
         }
     }
 }
+
+type Ended = bool;
 
 #[derive(Debug)]
 pub enum StageEvent<W>
@@ -116,13 +79,13 @@ where
     WorkerDone(W),
     MessagingError(W),
     NextUnit(W, W::WorkUnit),
-    ScheduleError(W, Error, Retry),
+    ScheduleError(W, Error<W>, Retry),
     ExecuteOk(W),
-    ExecuteError(W, W::WorkUnit, Error, Retry),
+    ExecuteError(W, Error<W>, Retry),
     BootstrapOk(W),
-    BootstrapError(Error, Retry),
-    TeardownOk,
-    TeardownError(W, Error, Retry),
+    BootstrapError(Error<W>, Retry),
+    TeardownOk(W::Config, Ended),
+    TeardownError(W, Error<W>, Retry, Ended),
 }
 
 struct StageMachine<W>
@@ -134,19 +97,24 @@ where
     policy: Policy,
     name: String,
     tick_count: metrics::Counter,
-    config: W::Config,
 }
 
 #[inline]
-fn log_stage_error(err: &Error, retry: &Retry) {
+fn log_stage_error<W: Worker>(err: &Error<W>, retry: &Retry) {
     match err {
-        Error::ShouldRestart => warn!(?retry, "stage should restart"),
-        Error::RetryableError => warn!(?retry, "work should be retried"),
-        Error::WorkPanic => error!(?retry, "work panic"),
+        Error::BootstrapRetry(_) => warn!("bootstrap should retry"),
+        Error::BootstrapPanic(_) => error!("bootstrap panic, stage ending"),
+        Error::ScheduleRetry => warn!("schedule should retry"),
+        Error::SchedulePanic => error!("schedule panic, staging ending"),
+        Error::ExecuteRestart(..) => warn!(?retry, "stage should restart"),
+        Error::ExecuteRetry(..) => warn!(?retry, "work should be retried"),
+        Error::ExecutePanic(..) => error!(?retry, "work panic"),
+        Error::ExecuteDismiss(_) => warn!("work error, dismissing unit"),
         Error::RecvError => error!(?retry, "stage error while receiving message"),
         Error::SendError => error!(?retry, "stage error while sending message"),
-        Error::NotConnected => error!(?retry, "stage not connected",),
-        x => error!(?retry, "stage error {}", x),
+        Error::TeardownRetry(_) => warn!("teardown should retry"),
+        Error::TeardownPanic(_) => error!("teardown panic, stage ending"),
+        //x => error!(?retry, "stage error {}", x),
     };
 }
 
@@ -157,15 +125,15 @@ where
 {
     match event {
         StageEvent::ExecuteOk(..) => trace!("unit executed"),
-        StageEvent::BootstrapError(e, r) => log_stage_error(e, r),
+        StageEvent::BootstrapError(e, r, ..) => log_stage_error(e, r),
         StageEvent::NextUnit(..) => trace!("next unit scheduled"),
-        StageEvent::ScheduleError(_, e, r) => log_stage_error(e, r),
-        StageEvent::ExecuteError(_, _, e, r) => log_stage_error(e, r),
+        StageEvent::ScheduleError(e, r) => log_stage_error(e, r),
+        StageEvent::ExecuteError(_, e, r) => log_stage_error(e, r),
         StageEvent::MessagingError(_) => error!("messaging error"),
         StageEvent::Dismissed(_) => info!("stage dismissed"),
         StageEvent::BootstrapOk(_) => info!("stage bootstrap ok"),
-        StageEvent::TeardownOk => info!("stage teardown ok"),
-        StageEvent::TeardownError(_, e, r) => log_stage_error(e, r),
+        StageEvent::TeardownOk(..) => info!("stage teardown ok"),
+        StageEvent::TeardownError(_, e, r, ..) => log_stage_error(e, r),
         StageEvent::WorkerIdle(_) => trace!("worker is idle"),
         StageEvent::WorkerDone(_) => trace!("worker is done"),
     }
@@ -177,19 +145,18 @@ where
 {
     fn new(anchor: Arc<Anchor>, config: W::Config, policy: Policy, name: String) -> Self {
         StageMachine {
-            state: Some(StageState::Bootstrap(Retry::new())),
+            state: Some(StageState::Bootstrap(config, Retry::new())),
             tick_count: Default::default(),
             name,
             anchor,
             policy,
-            config,
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn bootstrap(&mut self, retry: Retry) -> StageEvent<W> {
+    async fn bootstrap(&mut self, config: W::Config, retry: Retry) -> StageEvent<W> {
         if let Err(err) = retry.ok(&self.policy.bootstrap_retry) {
-            return StageEvent::BootstrapError(err, retry);
+            return StageEvent::BootstrapError(Error::BootstrapPanic(config), retry);
         }
 
         retry
@@ -199,9 +166,7 @@ where
             )
             .await;
 
-        let mut metrics = self.anchor.metrics.write().unwrap();
-
-        match W::bootstrap(&self.config, &mut metrics).await {
+        match W::bootstrap(config).await {
             Ok(w) => StageEvent::BootstrapOk(w),
             Err(x) => return StageEvent::BootstrapError(x, retry),
         }
@@ -210,7 +175,7 @@ where
     #[instrument(level = Level::INFO, skip_all)]
     async fn schedule(&mut self, mut worker: W, retry: Retry) -> StageEvent<W> {
         if let Err(err) = retry.ok(&self.policy.work_retry) {
-            return StageEvent::ScheduleError(worker, err, retry);
+            return StageEvent::ScheduleError(worker, Error::SchedulePanic, retry);
         }
 
         retry
@@ -240,7 +205,7 @@ where
         retry: Retry,
     ) -> StageEvent<W> {
         if let Err(err) = retry.ok(&self.policy.work_retry) {
-            return StageEvent::ExecuteError(worker, unit, err, retry);
+            return StageEvent::ExecuteError(worker, err, retry);
         }
 
         retry
@@ -250,16 +215,16 @@ where
             )
             .await;
 
-        match worker.execute(&mut unit).await {
+        match worker.execute(unit).await {
             Ok(_) => StageEvent::ExecuteOk(worker),
-            Err(err) => StageEvent::ExecuteError(worker, unit, err, retry),
+            Err(err) => StageEvent::ExecuteError(worker, err, retry),
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn teardown(&mut self, mut worker: W, retry: Retry) -> StageEvent<W> {
+    async fn teardown(&mut self, mut worker: W, retry: Retry, ended: Ended) -> StageEvent<W> {
         if let Err(err) = retry.ok(&self.policy.teardown_retry) {
-            return StageEvent::TeardownError(worker, err, retry);
+            return StageEvent::TeardownError(worker, err, retry, ended);
         }
 
         retry
@@ -270,8 +235,8 @@ where
             .await;
 
         match worker.teardown().await {
-            Ok(_) => StageEvent::TeardownOk,
-            Err(x) => return StageEvent::TeardownError(worker, x, retry.clone()),
+            Ok(x) => StageEvent::TeardownOk(x, ended),
+            Err(x) => return StageEvent::TeardownError(worker, x, retry.clone(), ended),
         }
     }
 
@@ -280,7 +245,7 @@ where
             // if stage is dismissed, return early
             if *self.anchor.dismissed_rx.borrow() {
                 match prev_state {
-                    StageState::Bootstrap(..) => return StageEvent::TeardownOk,
+                    StageState::Bootstrap(c, ..) => return StageEvent::TeardownOk(c, true),
                     StageState::Scheduling(w, ..) => return StageEvent::Dismissed(w),
                     StageState::Executing(w, _, _) => return StageEvent::Dismissed(w),
                     _ => (),
@@ -289,10 +254,10 @@ where
         }
 
         match prev_state {
-            StageState::Bootstrap(retry) => self.bootstrap(retry).await,
+            StageState::Bootstrap(config, retry) => self.bootstrap(config, retry).await,
             StageState::Scheduling(worker, retry) => self.schedule(worker, retry).await,
             StageState::Executing(worker, unit, retry) => self.execute(worker, unit, retry).await,
-            StageState::Teardown(worker, retry) => self.teardown(worker, retry).await,
+            StageState::Teardown(worker, retry, ended) => self.teardown(worker, retry, ended).await,
             StageState::Ended => unreachable!("ended stage shouldn't actuate"),
         }
     }
@@ -301,31 +266,30 @@ where
         match event {
             StageEvent::BootstrapOk(w) => StageState::Scheduling(w, Retry::new()),
             StageEvent::BootstrapError(err, retry) => match err {
-                Error::ShouldRestart => StageState::Bootstrap(retry.next()),
-                Error::RetryableError => StageState::Bootstrap(retry.next()),
+                Error::BootstrapRetry(c) => StageState::Bootstrap(c, retry.next()),
                 _ => StageState::Ended,
             },
             StageEvent::NextUnit(w, u) => StageState::Executing(w, u, Retry::new()),
             StageEvent::WorkerIdle(w) => StageState::Scheduling(w, Retry::new()),
             StageEvent::ScheduleError(w, err, retry) => match err {
-                Error::ShouldRestart => StageState::Bootstrap(Retry::new()),
-                Error::RetryableError => StageState::Scheduling(w, retry.next()),
-                Error::DismissableError => StageState::Scheduling(w, Retry::new()),
-                _ => StageState::Teardown(w, Retry::new()),
+                Error::ScheduleRetry => StageState::Scheduling(w, retry.next()),
+                Error::ScheduleRestart => StageState::Teardown(w, Retry::new(), false),
+                _ => StageState::Teardown(w, Retry::new(), true),
             },
             StageEvent::ExecuteOk(w) => StageState::Scheduling(w, Retry::new()),
-            StageEvent::ExecuteError(w, unit, err, retry) => match err {
-                Error::RetryableError => StageState::Executing(w, unit, retry.next()),
-                Error::DismissableError => StageState::Scheduling(w, Retry::new()),
-                Error::ShouldRestart => StageState::Bootstrap(Retry::new()),
-                _ => StageState::Teardown(w, Retry::new()),
+            StageEvent::ExecuteError(w, err, retry) => match err {
+                Error::ExecuteRetry(unit) => StageState::Executing(w, unit, retry.next()),
+                Error::ExecuteDismiss(..) => StageState::Scheduling(w, Retry::new()),
+                Error::ExecuteRestart(..) => StageState::Teardown(w, Retry::new(), true),
+                _ => StageState::Teardown(w, Retry::new(), false),
             },
-            StageEvent::WorkerDone(w) => StageState::Teardown(w, Retry::new()),
-            StageEvent::MessagingError(w) => StageState::Teardown(w, Retry::new()),
-            StageEvent::Dismissed(w) => StageState::Teardown(w, Retry::new()),
-            StageEvent::TeardownOk => StageState::Ended,
-            StageEvent::TeardownError(w, err, retry) => match err {
-                Error::RetryableError => StageState::Teardown(w, retry.next()),
+            StageEvent::WorkerDone(w) => StageState::Teardown(w, Retry::new(), true),
+            StageEvent::MessagingError(w) => StageState::Teardown(w, Retry::new(), true),
+            StageEvent::Dismissed(w) => StageState::Teardown(w, Retry::new(), true),
+            StageEvent::TeardownOk(c, false) => StageState::Bootstrap(c, Retry::new()),
+            StageEvent::TeardownOk(c, true) => StageState::Ended,
+            StageEvent::TeardownError(w, err, retry, ended) => match err {
+                Error::TeardownRetry(x) => StageState::Teardown(w, retry.next(), ended),
                 _ => StageState::Ended,
             },
         }
@@ -381,10 +345,10 @@ impl Anchor {
         }
     }
 
-    fn dismiss_stage(&self) -> Result<(), Error> {
+    fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
         self.dismissed_tx
             .send(true)
-            .map_err(|_| Error::TetherDropped)?;
+            .map_err(|_| crate::error::Error::TetherDropped)?;
 
         Ok(())
     }
@@ -415,14 +379,14 @@ impl Tether {
             .expect("called from outside thread");
     }
 
-    fn try_anchor(&self) -> Result<Arc<Anchor>, Error> {
+    fn try_anchor(&self) -> Result<Arc<Anchor>, crate::error::Error> {
         match self.anchor_ref.upgrade() {
             Some(anchor) => Ok(anchor),
-            None => Err(Error::TetherDropped),
+            None => Err(crate::error::Error::TetherDropped),
         }
     }
 
-    pub fn dismiss_stage(&self) -> Result<(), Error> {
+    pub fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
         let anchor = self.try_anchor()?;
         anchor.dismiss_stage()
     }
@@ -458,7 +422,7 @@ impl Tether {
         }
     }
 
-    pub fn read_metrics(&self) -> Result<Readings, Error> {
+    pub fn read_metrics(&self) -> Result<Readings, crate::error::Error> {
         let anchor = self.try_anchor()?;
         let metrics = anchor.metrics.read().unwrap();
         let readings = collect_readings(&metrics);
@@ -558,12 +522,9 @@ pub mod tests {
         type WorkUnit = usize;
         type Config = MockConfig;
 
-        async fn bootstrap(
-            config: &Self::Config,
-            _: &mut metrics::Registry,
-        ) -> Result<Self, Error> {
+        async fn bootstrap(config: Self::Config) -> BootstrapResult<Self> {
             Ok(Self {
-                config: config.clone(),
+                config,
                 bootstrap_count: 1,
                 schedule_count: 0,
                 execute_count: 0,
@@ -571,25 +532,25 @@ pub mod tests {
             })
         }
 
-        async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
+        async fn schedule(&mut self) -> ScheduleResult<Self> {
             self.schedule_count += 1;
 
             Ok(WorkSchedule::Unit(self.schedule_count))
         }
 
-        async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
+        async fn execute(&mut self, unit: Self::WorkUnit) -> ExecuteResult<Self> {
             self.execute_count += 1;
 
-            match self.should_fail(*unit) {
-                true => Err(Error::RetryableError),
+            match self.should_fail(unit) {
+                true => Err(Error::WorkRetry(unit)),
                 false => Ok(()),
             }
         }
 
-        async fn teardown(&mut self) -> Result<(), Error> {
+        async fn teardown(self) -> TeardownResult<Self> {
             self.teardown_count += 1;
 
-            Ok(())
+            Ok(self.config)
         }
     }
 
@@ -602,7 +563,7 @@ pub mod tests {
     }
 
     async fn should_bootstrap(machine: &mut StageMachine<MockWorker>) {
-        assert!(matches!(machine.state, Some(StageState::Bootstrap(_))));
+        assert!(matches!(machine.state, Some(StageState::Bootstrap(..))));
         machine.transition().await;
 
         let worker = machine.state.as_ref().unwrap().worker().unwrap();

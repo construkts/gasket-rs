@@ -146,7 +146,6 @@ pub struct InputPort<A, P>
 where
     A: RecvAdapter<P>,
 {
-    counter: u64,
     receiver: Option<A>,
     _phantom: PhantomData<P>,
 }
@@ -157,7 +156,6 @@ where
 {
     fn default() -> Self {
         Self {
-            counter: 0,
             receiver: Default::default(),
             _phantom: Default::default(),
         }
@@ -170,7 +168,6 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            counter: self.counter.clone(),
             receiver: self.receiver.clone(),
             _phantom: self._phantom.clone(),
         }
@@ -184,7 +181,6 @@ where
     pub async fn recv(&mut self) -> Result<Message<P>, Error> {
         let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
         let msg = receiver.recv().await?;
-        self.counter += 1;
 
         Ok(msg)
     }
