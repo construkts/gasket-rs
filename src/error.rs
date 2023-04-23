@@ -14,9 +14,6 @@ pub enum Error {
     #[error("error receiving work unit through input port")]
     RecvError,
 
-    #[error("max retries reached")]
-    MaxRetries,
-
     #[error("can't perform action since tether to stage was dropped")]
     TetherDropped,
 }

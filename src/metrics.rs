@@ -1,13 +1,10 @@
 use crossbeam::atomic::AtomicCell;
 use std::{collections::HashMap, sync::Arc};
 
+#[derive(Default)]
 pub struct Registry(HashMap<&'static str, Metric>);
 
 impl Registry {
-    pub fn new() -> Self {
-        Self(HashMap::new())
-    }
-
     pub fn counter(&mut self, key: &'static str) -> Counter {
         let metric = self
             .0
@@ -74,13 +71,10 @@ pub fn collect_readings(registry: &Registry) -> Readings {
         .collect::<Readings>()
 }
 
+#[derive(Default)]
 pub struct Builder(Registry);
 
 impl Builder {
-    pub fn new() -> Self {
-        Self(Registry(HashMap::new()))
-    }
-
     fn with_metric(self, key: &'static str, metric: Metric) -> Self {
         let Builder(mut metrics) = self;
         metrics.0.insert(key, metric);

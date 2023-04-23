@@ -48,7 +48,7 @@ where
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            _phantom: self._phantom.clone(),
+            _phantom: self._phantom,
         }
     }
 }
@@ -169,7 +169,7 @@ where
     fn clone(&self) -> Self {
         Self {
             receiver: self.receiver.clone(),
-            _phantom: self._phantom.clone(),
+            _phantom: self._phantom,
         }
     }
 }
@@ -232,6 +232,10 @@ impl<P> SinkAdapter<P> {
 
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
     }
 }
 

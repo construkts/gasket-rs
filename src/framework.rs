@@ -4,95 +4,61 @@ use thiserror::Error;
 use tracing::{error, warn};
 
 #[derive(Error, Debug)]
-pub enum Error<W: Worker> {
-    #[error("bootstrap should be retried")]
-    BootstrapRetry(W::Config),
-
-    #[error("bootstrap failed, stage should end")]
-    BootstrapPanic(W::Config),
-
-    #[error("teardown should be retried")]
-    TeardownRetry(W),
-
-    #[error("teardown failed, stage should end")]
-    TeardownPanic(W),
-
-    #[error("schedule should be retried")]
-    ScheduleRetry,
-
-    #[error("schedule requires a stage restart")]
-    ScheduleRestart,
-
-    #[error("schedule failed, stage should end")]
-    SchedulePanic,
-
+pub enum WorkerError {
     #[error("error sending work unit through output port")]
-    SendError,
+    Send,
 
     #[error("error receiving work unit through input port")]
-    RecvError,
+    Recv,
 
-    #[error("stage panic, stopping all work")]
-    ExecutePanic(W::WorkUnit),
+    #[error("operation panic, stage should stop")]
+    Panic,
 
-    #[error("work unit requires a restart of the stage")]
-    ExecuteRestart(W::WorkUnit),
+    #[error("operation requires a restart of the stage")]
+    Restart,
 
-    #[error("work unit should be retried")]
-    ExecuteRetry(W::WorkUnit),
-
-    #[error("work unit can be dismissed")]
-    ExecuteDismiss(W::WorkUnit),
+    #[error("operation should be retried")]
+    Retry,
 }
 
-pub trait AsWorkError<T, W: Worker> {
-    fn or_panic(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>>;
-    fn or_dismiss(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>>;
-    fn or_retry(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>>;
-    fn or_restart(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>>;
+type Result<T> = core::result::Result<T, WorkerError>;
+
+pub trait AsWorkError<T> {
+    fn or_panic(self) -> Result<T>;
+    fn or_retry(self) -> Result<T>;
+    fn or_restart(self) -> Result<T>;
 }
 
-impl<T, E, W> AsWorkError<T, W> for Result<T, E>
+impl<T, E> AsWorkError<T> for core::result::Result<T, E>
 where
-    W: Worker,
     E: Display,
 {
-    fn or_panic(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>> {
+    fn or_panic(self) -> Result<T> {
         match self {
             Ok(x) => Ok(x),
             Err(x) => {
                 error!(%x);
-                Err(Error::WorkPanic(unit()))
+                Err(WorkerError::Panic)
             }
         }
     }
 
-    fn or_dismiss(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>> {
+    fn or_retry(self) -> Result<T> {
         match self {
             Ok(x) => Ok(x),
             Err(x) => {
                 warn!(%x);
-                Err(Error::WorkDismiss(unit()))
+                Err(WorkerError::Retry)
             }
         }
     }
 
-    fn or_retry(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>> {
+    fn or_restart(self) -> Result<T> {
         match self {
             Ok(x) => Ok(x),
             Err(x) => {
                 warn!(%x);
-                Err(Error::WorkRetry(unit()))
-            }
-        }
-    }
-
-    fn or_restart(self, unit: fn() -> W::WorkUnit) -> Result<T, Error<W>> {
-        match self {
-            Ok(x) => Ok(x),
-            Err(x) => {
-                warn!(%x);
-                Err(Error::WorkRestart(unit()))
+                Err(WorkerError::Restart)
             }
         }
     }
@@ -107,11 +73,6 @@ pub enum WorkSchedule<U> {
     Done,
 }
 
-pub type BootstrapResult<W: Worker> = Result<W, Error<W>>;
-pub type ScheduleResult<W: Worker> = Result<WorkSchedule<W::WorkUnit>, Error<W>>;
-pub type ExecuteResult<W: Worker> = Result<(), Error<W>>;
-pub type TeardownResult<W: Worker> = Result<W::Config, Error<W>>;
-
 #[async_trait::async_trait(?Send)]
 pub trait Worker: Send + Sized {
     type WorkUnit: Sized + Send;
@@ -120,19 +81,27 @@ pub trait Worker: Send + Sized {
     /// Bootstrap a new worker
     ///
     /// It's responsible for initializing any resources needed by the worker.
-    async fn bootstrap(config: Self::Config) -> BootstrapResult<Self>;
+    async fn bootstrap(config: &Self::Config) -> Result<Self>;
 
     /// Schedule the next work unit for execution
     ///
     /// This usually means reading messages from input ports and returning a
     /// work unit that contains all data required for execution.
-    async fn schedule(&mut self) -> ScheduleResult<Self>;
+    async fn schedule(&mut self, config: &mut Self::Config)
+        -> Result<WorkSchedule<Self::WorkUnit>>;
 
     /// Execute the action described by the work unit
     ///
     /// This usually means doing required computation, generating side-effect
     /// and submitting message through the output ports
-    async fn execute(&mut self, unit: Self::WorkUnit) -> ExecuteResult<Self>;
+    async fn execute(&mut self, unit: &Self::WorkUnit, config: &mut Self::Config) -> Result<()>;
 
-    async fn teardown(self) -> TeardownResult<Self>;
+    /// Shutdown the worker gracefully
+    ///
+    /// This usually means releasing any relevant resources in use by the
+    /// current worker, either because we need them for a different worker or
+    /// because the stage is being dismissed.
+    async fn teardown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }

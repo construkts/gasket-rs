@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use gasket::{
-    error::Error,
+    framework::{AsWorkError, WorkSchedule, Worker, WorkerError},
     messaging::tokio::{connect_ports, InputPort, OutputPort},
-    metrics::{self, Counter},
+    metrics::Counter,
     retries,
-    runtime::{spawn_stage, Policy, ScheduleResult, WorkSchedule, Worker},
+    runtime::{spawn_stage, Policy},
 };
 
 #[derive(Clone)]
@@ -15,7 +15,6 @@ struct TickerSpec {
 }
 
 struct Ticker {
-    spec: TickerSpec,
     next_delay: u64,
 }
 
@@ -29,17 +28,16 @@ impl Worker for Ticker {
     type WorkUnit = TickerUnit;
     type Config = TickerSpec;
 
-    async fn bootstrap(
-        config: &Self::Config,
-        metrics: &mut metrics::Registry,
-    ) -> Result<Self, Error> {
+    async fn bootstrap(_: &Self::Config) -> Result<Self, WorkerError> {
         Ok(Self {
-            spec: config.clone(),
             next_delay: Default::default(),
         })
     }
 
-    async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
+    async fn schedule(
+        &mut self,
+        _: &mut Self::Config,
+    ) -> Result<WorkSchedule<Self::WorkUnit>, WorkerError> {
         let unit = TickerUnit {
             instant: Instant::now(),
             delay: self.next_delay,
@@ -48,45 +46,49 @@ impl Worker for Ticker {
         Ok(WorkSchedule::Unit(unit))
     }
 
-    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
+    async fn execute(
+        &mut self,
+        unit: &Self::WorkUnit,
+        config: &mut Self::Config,
+    ) -> Result<(), WorkerError> {
         tokio::time::sleep(Duration::from_secs(unit.delay)).await;
-        self.spec.output.send(unit.instant.into()).await?;
+        config.output.send(unit.instant.into()).await.or_panic()?;
 
-        self.spec.value_1.inc(3);
+        config.value_1.inc(3);
         self.next_delay += 1;
 
         Ok(())
     }
 }
 
-#[derive(Clone)]
 struct TerminalSpec {
     input: InputPort<Instant>,
 }
 
-struct Terminal {
-    spec: TerminalSpec,
-}
+struct Terminal;
 
 #[async_trait::async_trait(?Send)]
 impl Worker for Terminal {
     type WorkUnit = Instant;
-    type Config = ();
+    type Config = TerminalSpec;
 
-    async fn bootstrap(
-        config: &Self::Config,
-        metrics: &mut metrics::Registry,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            input: Default::default(),
-        })
+    async fn bootstrap(_: &Self::Config) -> Result<Self, WorkerError> {
+        Ok(Self)
     }
-    async fn schedule(&mut self) -> ScheduleResult<Self::WorkUnit> {
-        let msg = self.input.recv().await?;
+
+    async fn schedule(
+        &mut self,
+        config: &mut Self::Config,
+    ) -> Result<WorkSchedule<Self::WorkUnit>, WorkerError> {
+        let msg = config.input.recv().await.or_panic()?;
         Ok(WorkSchedule::Unit(msg.payload))
     }
 
-    async fn execute(&mut self, unit: &Self::WorkUnit) -> Result<(), Error> {
+    async fn execute(
+        &mut self,
+        unit: &Self::WorkUnit,
+        _: &mut Self::Config,
+    ) -> Result<(), WorkerError> {
         println!("{:?}", unit.elapsed());
 
         Ok(())
@@ -124,7 +126,7 @@ fn main() {
     );
 
     let tether2 = spawn_stage::<Terminal>(
-        (),
+        terminal,
         Policy {
             tick_timeout: None,
             bootstrap_retry: retries::Policy::no_retry(),
@@ -141,17 +143,17 @@ fn main() {
             match tether.check_state() {
                 gasket::runtime::TetherState::Dropped => println!("tether dropped"),
                 gasket::runtime::TetherState::Blocked(x) => {
-                    println!("tether blocked, last state: {:?}", x)
+                    println!("tether blocked, last state: {x:?}")
                 }
                 gasket::runtime::TetherState::Alive(x) => {
-                    println!("tether alive, last state: {:?}", x)
+                    println!("tether alive, last state: {x:?}")
                 }
             }
 
             match tether.read_metrics() {
                 Ok(readings) => {
                     for (key, value) in readings {
-                        println!("{}: {:?}", key, value);
+                        println!("{key}: {value:?}");
                     }
                 }
                 Err(err) => {
@@ -162,7 +164,7 @@ fn main() {
         }
 
         std::thread::sleep(Duration::from_secs(5));
-        println!("check loop {}", i);
+        println!("check loop {i}");
     }
 
     for tether in tethers {
