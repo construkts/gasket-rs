@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use gasket::{
-    framework::{AsWorkError, WorkSchedule, Worker, WorkerError},
+    framework::{AsWorkError, Stage, WorkSchedule, Worker, WorkerError},
     messaging::tokio::{connect_ports, InputPort, OutputPort},
     metrics::Counter,
     retries,
@@ -12,6 +12,12 @@ use gasket::{
 struct TickerSpec {
     output: OutputPort<Instant>,
     value_1: Counter,
+}
+
+impl Stage for TickerSpec {
+    fn register_metrics(&self, registry: &mut gasket::metrics::Registry) {
+        registry.track_counter("value_1", &self.value_1);
+    }
 }
 
 struct Ticker {
@@ -25,10 +31,10 @@ struct TickerUnit {
 
 #[async_trait::async_trait(?Send)]
 impl Worker for Ticker {
-    type WorkUnit = TickerUnit;
-    type Config = TickerSpec;
+    type Unit = TickerUnit;
+    type Stage = TickerSpec;
 
-    async fn bootstrap(_: &Self::Config) -> Result<Self, WorkerError> {
+    async fn bootstrap(_: &Self::Stage) -> Result<Self, WorkerError> {
         Ok(Self {
             next_delay: Default::default(),
         })
@@ -36,8 +42,8 @@ impl Worker for Ticker {
 
     async fn schedule(
         &mut self,
-        _: &mut Self::Config,
-    ) -> Result<WorkSchedule<Self::WorkUnit>, WorkerError> {
+        _: &mut Self::Stage,
+    ) -> Result<WorkSchedule<Self::Unit>, WorkerError> {
         let unit = TickerUnit {
             instant: Instant::now(),
             delay: self.next_delay,
@@ -48,13 +54,13 @@ impl Worker for Ticker {
 
     async fn execute(
         &mut self,
-        unit: &Self::WorkUnit,
-        config: &mut Self::Config,
+        unit: &Self::Unit,
+        stage: &mut Self::Stage,
     ) -> Result<(), WorkerError> {
         tokio::time::sleep(Duration::from_secs(unit.delay)).await;
-        config.output.send(unit.instant.into()).await.or_panic()?;
+        stage.output.send(unit.instant.into()).await.or_panic()?;
 
-        config.value_1.inc(3);
+        stage.value_1.inc(3);
         self.next_delay += 1;
 
         Ok(())
@@ -65,30 +71,30 @@ struct TerminalSpec {
     input: InputPort<Instant>,
 }
 
+impl Stage for TerminalSpec {
+    fn register_metrics(&self, _: &mut gasket::metrics::Registry) {}
+}
+
 struct Terminal;
 
 #[async_trait::async_trait(?Send)]
 impl Worker for Terminal {
-    type WorkUnit = Instant;
-    type Config = TerminalSpec;
+    type Unit = Instant;
+    type Stage = TerminalSpec;
 
-    async fn bootstrap(_: &Self::Config) -> Result<Self, WorkerError> {
+    async fn bootstrap(_: &Self::Stage) -> Result<Self, WorkerError> {
         Ok(Self)
     }
 
     async fn schedule(
         &mut self,
-        config: &mut Self::Config,
-    ) -> Result<WorkSchedule<Self::WorkUnit>, WorkerError> {
-        let msg = config.input.recv().await.or_panic()?;
+        stage: &mut Self::Stage,
+    ) -> Result<WorkSchedule<Self::Unit>, WorkerError> {
+        let msg = stage.input.recv().await.or_panic()?;
         Ok(WorkSchedule::Unit(msg.payload))
     }
 
-    async fn execute(
-        &mut self,
-        unit: &Self::WorkUnit,
-        _: &mut Self::Config,
-    ) -> Result<(), WorkerError> {
+    async fn execute(&mut self, unit: &Self::Unit, _: &mut Self::Stage) -> Result<(), WorkerError> {
         println!("{:?}", unit.elapsed());
 
         Ok(())

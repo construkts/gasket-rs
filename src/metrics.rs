@@ -5,11 +5,11 @@ use std::{collections::HashMap, sync::Arc};
 pub struct Registry(HashMap<&'static str, Metric>);
 
 impl Registry {
-    pub fn counter(&mut self, key: &'static str) -> Counter {
+    pub fn track_counter(&mut self, key: &'static str, counter: &Counter) -> Counter {
         let metric = self
             .0
             .entry(key)
-            .or_insert_with(|| Metric::Counter(Counter::default()));
+            .or_insert_with(|| Metric::Counter(counter.clone()));
 
         match metric {
             Metric::Counter(x) => x.clone(),

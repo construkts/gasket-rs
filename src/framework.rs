@@ -3,6 +3,10 @@ use std::fmt::Display;
 use thiserror::Error;
 use tracing::{error, warn};
 
+pub trait Stage {
+    fn register_metrics(&self, registry: &mut crate::metrics::Registry);
+}
+
 #[derive(Error, Debug)]
 pub enum WorkerError {
     #[error("error sending work unit through output port")]
@@ -74,27 +78,26 @@ pub enum WorkSchedule<U> {
 }
 
 #[async_trait::async_trait(?Send)]
-pub trait Worker: Send + Sized {
-    type WorkUnit: Sized + Send;
-    type Config: Send;
+pub trait Worker: Sized {
+    type Unit: Sized + Send;
+    type Stage: Stage + Send;
 
     /// Bootstrap a new worker
     ///
     /// It's responsible for initializing any resources needed by the worker.
-    async fn bootstrap(config: &Self::Config) -> Result<Self>;
+    async fn bootstrap(stage: &Self::Stage) -> Result<Self>;
 
     /// Schedule the next work unit for execution
     ///
     /// This usually means reading messages from input ports and returning a
     /// work unit that contains all data required for execution.
-    async fn schedule(&mut self, config: &mut Self::Config)
-        -> Result<WorkSchedule<Self::WorkUnit>>;
+    async fn schedule(&mut self, stage: &mut Self::Stage) -> Result<WorkSchedule<Self::Unit>>;
 
     /// Execute the action described by the work unit
     ///
     /// This usually means doing required computation, generating side-effect
     /// and submitting message through the output ports
-    async fn execute(&mut self, unit: &Self::WorkUnit, config: &mut Self::Config) -> Result<()>;
+    async fn execute(&mut self, unit: &Self::Unit, stage: &mut Self::Stage) -> Result<()>;
 
     /// Shutdown the worker gracefully
     ///
