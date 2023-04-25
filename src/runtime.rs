@@ -450,18 +450,19 @@ where
     rt.block_on(async { while machine.transition().await != StagePhase::Ended {} });
 }
 
-pub fn spawn_stage<W>(stage: W::Stage, policy: Policy, name: Option<&str>) -> Tether
+pub fn spawn_stage<W>(stage: W::Stage) -> Tether
 where
     W: Worker + 'static,
 {
-    let name = name
-        .map(|x| x.to_owned())
-        .unwrap_or("un-named stage".into());
+    let name = stage.name().to_owned();
 
     let mut metrics = metrics::Registry::default();
     stage.register_metrics(&mut metrics);
+
     let anchor = Arc::new(Anchor::new(metrics));
     let anchor_ref = Arc::downgrade(&anchor);
+
+    let policy = stage.policy();
 
     let policy2 = policy.clone();
     let name2 = name.clone();
@@ -488,6 +489,14 @@ pub mod tests {
     }
 
     impl Stage for MockStage {
+        fn name(&self) -> &str {
+            "mockstage"
+        }
+
+        fn policy(&self) -> crate::runtime::Policy {
+            crate::runtime::Policy::default()
+        }
+
         fn register_metrics(&self, _: &mut crate::metrics::Registry) {}
     }
 

@@ -15,6 +15,19 @@ struct TickerSpec {
 }
 
 impl Stage for TickerSpec {
+    fn name(&self) -> &str {
+        "ticker"
+    }
+
+    fn policy(&self) -> gasket::runtime::Policy {
+        Policy {
+            tick_timeout: Some(Duration::from_secs(3)),
+            bootstrap_retry: retries::Policy::no_retry(),
+            work_retry: retries::Policy::no_retry(),
+            teardown_retry: retries::Policy::no_retry(),
+        }
+    }
+
     fn register_metrics(&self, registry: &mut gasket::metrics::Registry) {
         registry.track_counter("value_1", &self.value_1);
     }
@@ -72,6 +85,19 @@ struct TerminalSpec {
 }
 
 impl Stage for TerminalSpec {
+    fn name(&self) -> &str {
+        "terminal"
+    }
+
+    fn policy(&self) -> gasket::runtime::Policy {
+        Policy {
+            tick_timeout: None,
+            bootstrap_retry: retries::Policy::no_retry(),
+            work_retry: retries::Policy::no_retry(),
+            teardown_retry: retries::Policy::no_retry(),
+        }
+    }
+
     fn register_metrics(&self, _: &mut gasket::metrics::Registry) {}
 }
 
@@ -120,27 +146,9 @@ fn main() {
 
     connect_ports(&mut ticker.output, &mut terminal.input, 10);
 
-    let tether1 = spawn_stage::<Ticker>(
-        ticker,
-        Policy {
-            tick_timeout: Some(Duration::from_secs(3)),
-            bootstrap_retry: retries::Policy::no_retry(),
-            work_retry: retries::Policy::no_retry(),
-            teardown_retry: retries::Policy::no_retry(),
-        },
-        Some("ticker"),
-    );
+    let tether1 = spawn_stage::<Ticker>(ticker);
 
-    let tether2 = spawn_stage::<Terminal>(
-        terminal,
-        Policy {
-            tick_timeout: None,
-            bootstrap_retry: retries::Policy::no_retry(),
-            work_retry: retries::Policy::no_retry(),
-            teardown_retry: retries::Policy::no_retry(),
-        },
-        Some("terminal"),
-    );
+    let tether2 = spawn_stage::<Terminal>(terminal);
 
     let tethers = vec![tether1, tether2];
 

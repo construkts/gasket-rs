@@ -4,6 +4,8 @@ use thiserror::Error;
 use tracing::{error, warn};
 
 pub trait Stage {
+    fn name(&self) -> &str;
+    fn policy(&self) -> crate::runtime::Policy;
     fn register_metrics(&self, registry: &mut crate::metrics::Registry);
 }
 

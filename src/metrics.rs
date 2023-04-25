@@ -16,6 +16,18 @@ impl Registry {
             _ => unreachable!(),
         }
     }
+
+    pub fn track_gauge(&mut self, key: &'static str, gauge: &Gauge) -> Gauge {
+        let metric = self
+            .0
+            .entry(key)
+            .or_insert_with(|| Metric::Gauge(gauge.clone()));
+
+        match metric {
+            Metric::Gauge(x) => x.clone(),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
