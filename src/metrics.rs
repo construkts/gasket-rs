@@ -1,7 +1,34 @@
 use crossbeam::atomic::AtomicCell;
 use std::{collections::HashMap, sync::Arc};
 
-pub type Registry = HashMap<&'static str, Metric>;
+#[derive(Default)]
+pub struct Registry(HashMap<&'static str, Metric>);
+
+impl Registry {
+    pub fn track_counter(&mut self, key: &'static str, counter: &Counter) -> Counter {
+        let metric = self
+            .0
+            .entry(key)
+            .or_insert_with(|| Metric::Counter(counter.clone()));
+
+        match metric {
+            Metric::Counter(x) => x.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn track_gauge(&mut self, key: &'static str, gauge: &Gauge) -> Gauge {
+        let metric = self
+            .0
+            .entry(key)
+            .or_insert_with(|| Metric::Gauge(gauge.clone()));
+
+        match metric {
+            Metric::Gauge(x) => x.clone(),
+            _ => unreachable!(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Counter {
@@ -50,21 +77,19 @@ pub type Readings = Vec<(&'static str, Reading)>;
 
 pub fn collect_readings(registry: &Registry) -> Readings {
     registry
+        .0
         .iter()
         .map(|(key, value)| (&**key, value.read()))
         .collect::<Readings>()
 }
 
+#[derive(Default)]
 pub struct Builder(Registry);
 
 impl Builder {
-    pub fn new() -> Self {
-        Self(HashMap::new())
-    }
-
     fn with_metric(self, key: &'static str, metric: Metric) -> Self {
         let Builder(mut metrics) = self;
-        metrics.insert(key, metric);
+        metrics.0.insert(key, metric);
         Self(metrics)
     }
 
