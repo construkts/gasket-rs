@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod error;
 pub mod framework;
+pub mod macros;
 pub mod messaging;
 pub mod metrics;
 pub mod retries;
