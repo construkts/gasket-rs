@@ -1,9 +1,7 @@
 /target
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
 Cargo.lock
+
+scratchpad
+.DS_Store
+RELEASE.md
+.idea
