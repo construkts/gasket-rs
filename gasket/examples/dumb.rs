@@ -15,21 +15,17 @@ struct TickerSpec {
 }
 
 impl Stage for TickerSpec {
+    type Unit = TickerUnit;
+    type Worker = Ticker;
+
     fn name(&self) -> &str {
         "ticker"
     }
 
-    fn policy(&self) -> gasket::runtime::Policy {
-        Policy {
-            tick_timeout: Some(Duration::from_secs(3)),
-            bootstrap_retry: retries::Policy::no_retry(),
-            work_retry: retries::Policy::no_retry(),
-            teardown_retry: retries::Policy::no_retry(),
-        }
-    }
-
-    fn register_metrics(&self, registry: &mut gasket::metrics::Registry) {
+    fn metrics(&self) -> gasket::metrics::Registry {
+        let mut registry = gasket::metrics::Registry::default();
         registry.track_counter("value_1", &self.value_1);
+        registry
     }
 }
 
@@ -43,11 +39,8 @@ struct TickerUnit {
 }
 
 #[async_trait::async_trait(?Send)]
-impl Worker for Ticker {
-    type Unit = TickerUnit;
-    type Stage = TickerSpec;
-
-    async fn bootstrap(_: &Self::Stage) -> Result<Self, WorkerError> {
+impl Worker<TickerSpec> for Ticker {
+    async fn bootstrap(_: &TickerSpec) -> Result<Self, WorkerError> {
         Ok(Self {
             next_delay: Default::default(),
         })
@@ -55,8 +48,8 @@ impl Worker for Ticker {
 
     async fn schedule(
         &mut self,
-        _: &mut Self::Stage,
-    ) -> Result<WorkSchedule<Self::Unit>, WorkerError> {
+        _: &mut TickerSpec,
+    ) -> Result<WorkSchedule<TickerUnit>, WorkerError> {
         let unit = TickerUnit {
             instant: Instant::now(),
             delay: self.next_delay,
@@ -67,8 +60,8 @@ impl Worker for Ticker {
 
     async fn execute(
         &mut self,
-        unit: &Self::Unit,
-        stage: &mut Self::Stage,
+        unit: &TickerUnit,
+        stage: &mut TickerSpec,
     ) -> Result<(), WorkerError> {
         tokio::time::sleep(Duration::from_secs(unit.delay)).await;
         stage.output.send(unit.instant.into()).await.or_panic()?;
@@ -85,42 +78,35 @@ struct TerminalSpec {
 }
 
 impl Stage for TerminalSpec {
+    type Unit = Instant;
+    type Worker = Terminal;
+
     fn name(&self) -> &str {
         "terminal"
     }
 
-    fn policy(&self) -> gasket::runtime::Policy {
-        Policy {
-            tick_timeout: None,
-            bootstrap_retry: retries::Policy::no_retry(),
-            work_retry: retries::Policy::no_retry(),
-            teardown_retry: retries::Policy::no_retry(),
-        }
+    fn metrics(&self) -> gasket::metrics::Registry {
+        gasket::metrics::Registry::default()
     }
-
-    fn register_metrics(&self, _: &mut gasket::metrics::Registry) {}
 }
 
 struct Terminal;
 
 #[async_trait::async_trait(?Send)]
-impl Worker for Terminal {
-    type Unit = Instant;
-    type Stage = TerminalSpec;
-
-    async fn bootstrap(_: &Self::Stage) -> Result<Self, WorkerError> {
+impl Worker<TerminalSpec> for Terminal {
+    async fn bootstrap(_: &TerminalSpec) -> Result<Self, WorkerError> {
         Ok(Self)
     }
 
     async fn schedule(
         &mut self,
-        stage: &mut Self::Stage,
-    ) -> Result<WorkSchedule<Self::Unit>, WorkerError> {
+        stage: &mut TerminalSpec,
+    ) -> Result<WorkSchedule<Instant>, WorkerError> {
         let msg = stage.input.recv().await.or_panic()?;
         Ok(WorkSchedule::Unit(msg.payload))
     }
 
-    async fn execute(&mut self, unit: &Self::Unit, _: &mut Self::Stage) -> Result<(), WorkerError> {
+    async fn execute(&mut self, unit: &Instant, _: &mut TerminalSpec) -> Result<(), WorkerError> {
         println!("{:?}", unit.elapsed());
 
         Ok(())
@@ -146,9 +132,25 @@ fn main() {
 
     connect_ports(&mut ticker.output, &mut terminal.input, 10);
 
-    let tether1 = spawn_stage::<Ticker>(ticker);
+    let tether1 = spawn_stage(
+        ticker,
+        Policy {
+            tick_timeout: Some(Duration::from_secs(3)),
+            bootstrap_retry: retries::Policy::no_retry(),
+            work_retry: retries::Policy::no_retry(),
+            teardown_retry: retries::Policy::no_retry(),
+        },
+    );
 
-    let tether2 = spawn_stage::<Terminal>(terminal);
+    let tether2 = spawn_stage(
+        terminal,
+        Policy {
+            tick_timeout: None,
+            bootstrap_retry: retries::Policy::no_retry(),
+            work_retry: retries::Policy::no_retry(),
+            teardown_retry: retries::Policy::no_retry(),
+        },
+    );
 
     let tethers = vec![tether1, tether2];
 

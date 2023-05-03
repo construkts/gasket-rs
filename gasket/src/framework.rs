@@ -3,10 +3,18 @@ use std::fmt::Display;
 use thiserror::Error;
 use tracing::{error, warn};
 
-pub trait Stage {
+#[cfg(feature = "derive")]
+pub use gasket_derive::*;
+
+pub trait Stage: Sized + Send {
+    type Unit;
+    type Worker: Worker<Self>;
+
     fn name(&self) -> &str;
-    fn policy(&self) -> crate::runtime::Policy;
-    fn register_metrics(&self, registry: &mut crate::metrics::Registry);
+
+    fn metrics(&self) -> crate::metrics::Registry {
+        Default::default()
+    }
 }
 
 #[derive(Error, Debug)]
@@ -80,26 +88,26 @@ pub enum WorkSchedule<U> {
 }
 
 #[async_trait::async_trait(?Send)]
-pub trait Worker: Sized {
-    type Unit: Sized + Send;
-    type Stage: Stage + Send;
-
+pub trait Worker<S>: Sized
+where
+    S: Stage,
+{
     /// Bootstrap a new worker
     ///
     /// It's responsible for initializing any resources needed by the worker.
-    async fn bootstrap(stage: &Self::Stage) -> Result<Self>;
+    async fn bootstrap(stage: &S) -> Result<Self>;
 
     /// Schedule the next work unit for execution
     ///
     /// This usually means reading messages from input ports and returning a
     /// work unit that contains all data required for execution.
-    async fn schedule(&mut self, stage: &mut Self::Stage) -> Result<WorkSchedule<Self::Unit>>;
+    async fn schedule(&mut self, stage: &mut S) -> Result<WorkSchedule<S::Unit>>;
 
     /// Execute the action described by the work unit
     ///
     /// This usually means doing required computation, generating side-effect
     /// and submitting message through the output ports
-    async fn execute(&mut self, unit: &Self::Unit, stage: &mut Self::Stage) -> Result<()>;
+    async fn execute(&mut self, unit: &S::Unit, stage: &mut S) -> Result<()>;
 
     /// Shutdown the worker gracefully
     ///
