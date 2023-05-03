@@ -25,23 +25,23 @@ pub enum StagePhase {
 }
 
 #[derive(Clone, Debug)]
-pub enum StageState<W>
+pub enum StageState<S>
 where
-    W: Worker,
+    S: Stage,
 {
     Bootstrap(Retry),
-    Scheduling(W, Retry),
-    Executing(W, W::Unit, Retry),
-    Teardown(W, Retry, Ended),
+    Scheduling(S::Worker, Retry),
+    Executing(S::Worker, S::Unit, Retry),
+    Teardown(S::Worker, Retry, Ended),
     Ended,
 }
 
-impl<W> StageState<W>
+impl<S> StageState<S>
 where
-    W: Worker,
+    S: Stage,
 {
     #[cfg(test)]
-    fn worker(&self) -> Option<&W> {
+    fn worker(&self) -> Option<&S::Worker> {
         match self {
             StageState::Bootstrap(..) => None,
             StageState::Scheduling(x, ..) => Some(x),
@@ -52,11 +52,11 @@ where
     }
 }
 
-impl<W> From<&StageState<W>> for StagePhase
+impl<S> From<&StageState<S>> for StagePhase
 where
-    W: Worker,
+    S: Stage,
 {
-    fn from(value: &StageState<W>) -> Self {
+    fn from(value: &StageState<S>) -> Self {
         match value {
             StageState::Bootstrap(..) => Self::Bootstrap,
             StageState::Scheduling(..) => Self::Working,
@@ -70,30 +70,30 @@ where
 type Ended = bool;
 
 #[derive(Debug)]
-pub enum StageEvent<W>
+pub enum StageEvent<S>
 where
-    W: Worker,
+    S: Stage,
 {
-    Dismissed(W),
-    WorkerIdle(W),
-    WorkerDone(W),
-    MessagingError(W),
-    NextUnit(W, W::Unit),
-    ScheduleError(W, WorkerError, Retry),
-    ExecuteOk(W),
-    ExecuteError(W, W::Unit, WorkerError, Retry),
-    BootstrapOk(W),
+    Dismissed(S::Worker),
+    WorkerIdle(S::Worker),
+    WorkerDone(S::Worker),
+    MessagingError(S::Worker),
+    NextUnit(S::Worker, S::Unit),
+    ScheduleError(S::Worker, WorkerError, Retry),
+    ExecuteOk(S::Worker),
+    ExecuteError(S::Worker, S::Unit, WorkerError, Retry),
+    BootstrapOk(S::Worker),
     BootstrapError(WorkerError, Retry),
     TeardownOk(Ended),
-    TeardownError(W, WorkerError, Retry, Ended),
+    TeardownError(S::Worker, WorkerError, Retry, Ended),
 }
 
-struct StageMachine<W>
+struct StageMachine<S>
 where
-    W: Worker,
+    S: Stage,
 {
-    stage: W::Stage,
-    state: Option<StageState<W>>,
+    stage: S,
+    state: Option<StageState<S>>,
     anchor: Arc<Anchor>,
     policy: Policy,
     name: String,
@@ -113,9 +113,9 @@ fn log_worker_error(err: &WorkerError, retry: &Retry) {
 }
 
 #[inline]
-fn log_event<W>(event: &StageEvent<W>)
+fn log_event<S>(event: &StageEvent<S>)
 where
-    W: Worker,
+    S: Stage,
 {
     match event {
         StageEvent::ExecuteOk(..) => trace!("unit executed"),
@@ -133,11 +133,11 @@ where
     }
 }
 
-impl<W> StageMachine<W>
+impl<S> StageMachine<S>
 where
-    W: Worker,
+    S: Stage,
 {
-    fn new(anchor: Arc<Anchor>, stage: W::Stage, policy: Policy, name: String) -> Self {
+    fn new(anchor: Arc<Anchor>, stage: S, policy: Policy, name: String) -> Self {
         StageMachine {
             stage,
             state: Some(StageState::Bootstrap(Retry::fresh())),
@@ -149,7 +149,7 @@ where
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn bootstrap(&self, retry: Retry) -> StageEvent<W> {
+    async fn bootstrap(&self, retry: Retry) -> StageEvent<S> {
         retry
             .wait_backoff(
                 &self.policy.bootstrap_retry,
@@ -157,14 +157,14 @@ where
             )
             .await;
 
-        match W::bootstrap(&self.stage).await {
+        match S::Worker::bootstrap(&self.stage).await {
             Ok(w) => StageEvent::BootstrapOk(w),
             Err(x) => StageEvent::BootstrapError(x, retry),
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn schedule(&mut self, mut worker: W, retry: Retry) -> StageEvent<W> {
+    async fn schedule(&mut self, mut worker: S::Worker, retry: Retry) -> StageEvent<S> {
         retry
             .wait_backoff(
                 &self.policy.teardown_retry,
@@ -185,7 +185,12 @@ where
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn execute(&mut self, mut worker: W, unit: W::Unit, retry: Retry) -> StageEvent<W> {
+    async fn execute(
+        &mut self,
+        mut worker: S::Worker,
+        unit: S::Unit,
+        retry: Retry,
+    ) -> StageEvent<S> {
         retry
             .wait_backoff(
                 &self.policy.teardown_retry,
@@ -200,7 +205,12 @@ where
     }
 
     #[instrument(level = Level::INFO, skip_all)]
-    async fn teardown(&mut self, mut worker: W, retry: Retry, ended: Ended) -> StageEvent<W> {
+    async fn teardown(
+        &mut self,
+        mut worker: S::Worker,
+        retry: Retry,
+        ended: Ended,
+    ) -> StageEvent<S> {
         retry
             .wait_backoff(
                 &self.policy.teardown_retry,
@@ -214,7 +224,7 @@ where
         }
     }
 
-    async fn actuate(&mut self, prev_state: StageState<W>) -> StageEvent<W> {
+    async fn actuate(&mut self, prev_state: StageState<S>) -> StageEvent<S> {
         {
             // if stage is dismissed, return early
             if *self.anchor.dismissed_rx.borrow() {
@@ -236,7 +246,7 @@ where
         }
     }
 
-    fn apply(&self, event: StageEvent<W>) -> StageState<W> {
+    fn apply(&self, event: StageEvent<S>) -> StageState<S> {
         match event {
             StageEvent::BootstrapOk(w) => StageState::Scheduling(w, Retry::fresh()),
             StageEvent::BootstrapError(err, retry) => match err {
@@ -438,9 +448,9 @@ impl Default for Policy {
 }
 
 #[instrument(name="stage", level = Level::INFO, skip_all, fields(stage = machine.name))]
-fn fullfil_stage<W>(mut machine: StageMachine<W>)
+fn fullfil_stage<S>(mut machine: StageMachine<S>)
 where
-    W: Worker,
+    S: Stage,
 {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -450,24 +460,21 @@ where
     rt.block_on(async { while machine.transition().await != StagePhase::Ended {} });
 }
 
-pub fn spawn_stage<W>(stage: W::Stage) -> Tether
+pub fn spawn_stage<S: Stage>(stage: S, policy: Policy) -> Tether
 where
-    W: Worker + 'static,
+    S: Stage + 'static,
 {
     let name = stage.name().to_owned();
 
-    let mut metrics = metrics::Registry::default();
-    stage.register_metrics(&mut metrics);
+    let metrics = stage.metrics();
 
     let anchor = Arc::new(Anchor::new(metrics));
     let anchor_ref = Arc::downgrade(&anchor);
 
-    let policy = stage.policy();
-
     let policy2 = policy.clone();
     let name2 = name.clone();
     let thread_handle = std::thread::spawn(move || {
-        let machine = StageMachine::<W>::new(anchor, stage, policy2, name2);
+        let machine = StageMachine::<S>::new(anchor, stage, policy2, name2);
         fullfil_stage(machine);
     });
 
@@ -489,15 +496,16 @@ pub mod tests {
     }
 
     impl Stage for MockStage {
+        type Worker = MockWorker;
+        type Unit = usize;
+
         fn name(&self) -> &str {
             "mockstage"
         }
 
-        fn policy(&self) -> crate::runtime::Policy {
-            crate::runtime::Policy::default()
+        fn metrics(&self) -> crate::metrics::Registry {
+            metrics::Registry::default()
         }
-
-        fn register_metrics(&self, _: &mut crate::metrics::Registry) {}
     }
 
     pub struct MockWorker {
@@ -519,11 +527,8 @@ pub mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
-    impl Worker for MockWorker {
-        type Unit = usize;
-        type Stage = MockStage;
-
-        async fn bootstrap(_: &Self::Stage) -> Result<Self, WorkerError> {
+    impl Worker<MockStage> for MockWorker {
+        async fn bootstrap(_: &MockStage) -> Result<Self, WorkerError> {
             Ok(Self {
                 bootstrap_count: 1,
                 schedule_count: 0,
@@ -534,8 +539,8 @@ pub mod tests {
 
         async fn schedule(
             &mut self,
-            _: &mut Self::Stage,
-        ) -> Result<WorkSchedule<Self::Unit>, WorkerError> {
+            _: &mut MockStage,
+        ) -> Result<WorkSchedule<usize>, WorkerError> {
             self.schedule_count += 1;
 
             Ok(WorkSchedule::Unit(self.schedule_count))
@@ -543,8 +548,8 @@ pub mod tests {
 
         async fn execute(
             &mut self,
-            unit: &Self::Unit,
-            config: &mut Self::Stage,
+            unit: &usize,
+            config: &mut MockStage,
         ) -> Result<(), WorkerError> {
             self.execute_count += 1;
 
@@ -561,7 +566,7 @@ pub mod tests {
         }
     }
 
-    async fn should_teardown_and_end(machine: &mut StageMachine<MockWorker>) {
+    async fn should_teardown_and_end(machine: &mut StageMachine<MockStage>) {
         assert!(matches!(machine.state, Some(StageState::Teardown(..))));
 
         machine.transition().await;
@@ -569,7 +574,7 @@ pub mod tests {
         assert!(matches!(machine.state, Some(StageState::Ended)));
     }
 
-    async fn should_bootstrap(machine: &mut StageMachine<MockWorker>) {
+    async fn should_bootstrap(machine: &mut StageMachine<MockStage>) {
         assert!(matches!(machine.state, Some(StageState::Bootstrap(..))));
         machine.transition().await;
 

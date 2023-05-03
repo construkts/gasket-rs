@@ -1,22 +1,18 @@
 #[macro_export]
-macro_rules! stateless_mapper {
-    ($name:ident, | $stage_param:ident : $stage_type:ty, $unit_param:ident : $unit_type:ty |  => $map:expr) => {
-        #[derive(Default)]
-        pub(crate) struct $name;
-
+macro_rules! impl_mapper {
+    (| $worker_param:ident : $worker_type:ty, $stage_param:ident : $stage_type:ty, $unit_param:ident : $unit_type:ty |  => $map:expr) => {
         #[async_trait::async_trait(?Send)]
-        impl $crate::framework::Worker for $name {
-            type Unit = $unit_type;
-            type Stage = $stage_type;
-
-            async fn bootstrap(_: &Self::Stage) -> Result<Self, $crate::framework::WorkerError> {
-                Ok(Self)
+        impl $crate::framework::Worker<$stage_type> for $worker_type {
+            async fn bootstrap(
+                stage: &$stage_type,
+            ) -> Result<Self, $crate::framework::WorkerError> {
+                Ok(Self::from(stage))
             }
 
             async fn schedule(
                 &mut self,
-                stage: &mut Self::Stage,
-            ) -> Result<$crate::framework::WorkSchedule<Self::Unit>, $crate::framework::WorkerError>
+                stage: &mut $stage_type,
+            ) -> Result<$crate::framework::WorkSchedule<$unit_type>, $crate::framework::WorkerError>
             {
                 use $crate::framework::*;
                 let msg = stage.input.recv().await.or_panic()?;
@@ -26,10 +22,11 @@ macro_rules! stateless_mapper {
 
             async fn execute(
                 &mut self,
-                __unit: &Self::Unit,
-                __stage: &mut Self::Stage,
+                __unit: &$unit_type,
+                __stage: &mut $stage_type,
             ) -> Result<(), $crate::framework::WorkerError> {
                 use $crate::framework::*;
+                let $worker_param = self;
                 let $unit_param = __unit;
                 let $stage_param = __stage;
 
@@ -44,24 +41,20 @@ macro_rules! stateless_mapper {
 }
 
 #[macro_export]
-macro_rules! stateless_flatmapper {
-    ($name:ident, | $stage_param:ident : $stage_type:ty, $unit_param:ident : $unit_type:ty |  => $map:expr) => {
-        #[derive(Default)]
-        pub(crate) struct $name;
-
+macro_rules! impl_splitter {
+    (| $worker_param:ident : $worker_type:ty, $stage_param:ident : $stage_type:ty, $unit_param:ident : $unit_type:ty |  => $map:expr) => {
         #[async_trait::async_trait(?Send)]
-        impl $crate::framework::Worker for $name {
-            type Unit = $unit_type;
-            type Stage = $stage_type;
-
-            async fn bootstrap(_: &Self::Stage) -> Result<Self, $crate::framework::WorkerError> {
-                Ok(Self)
+        impl $crate::framework::Worker<$stage_type> for $worker_type {
+            async fn bootstrap(
+                stage: &$stage_type,
+            ) -> Result<Self, $crate::framework::WorkerError> {
+                Ok(Self::from(stage))
             }
 
             async fn schedule(
                 &mut self,
-                stage: &mut Self::Stage,
-            ) -> Result<$crate::framework::WorkSchedule<Self::Unit>, $crate::framework::WorkerError>
+                stage: &mut $stage_type,
+            ) -> Result<$crate::framework::WorkSchedule<$unit_type>, $crate::framework::WorkerError>
             {
                 use $crate::framework::*;
                 let msg = stage.input.recv().await.or_panic()?;
@@ -71,10 +64,11 @@ macro_rules! stateless_flatmapper {
 
             async fn execute(
                 &mut self,
-                __unit: &Self::Unit,
-                __stage: &mut Self::Stage,
+                __unit: &$unit_type,
+                __stage: &mut $stage_type,
             ) -> Result<(), $crate::framework::WorkerError> {
                 use $crate::framework::*;
+                let $worker_param = self;
                 let $unit_param = __unit;
                 let $stage_param = __stage;
 
