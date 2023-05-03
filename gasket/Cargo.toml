@@ -7,7 +7,7 @@ repository = "https://github.com/construkts/gasket-rs"
 homepage = "https://github.com/construkts/gasket-rs"
 documentation = "https://docs.rs/gasket"
 license = "Apache-2.0"
-readme = "README.md"
+readme = "../README.md"
 authors = ["Santiago Carmuega <santiago@carmuega.me>"]
 
 
@@ -18,10 +18,10 @@ serde = { version = "1.0.160", features = ["derive"] }
 thiserror = "1.0.30"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tracing = "0.1.37"
-gasket-derive = { version = "*", path = "../gasket-derive", optional = true }
+# gasket-derive = { version = "*", path = "../gasket-derive", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.16"
 
 [features]
-derive = ["gasket-derive"]
+# derive = ["gasket-derive"]

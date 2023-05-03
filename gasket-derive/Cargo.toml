@@ -7,7 +7,7 @@ repository = "https://github.com/construkts/gasket-rs"
 homepage = "https://github.com/construkts/gasket-rs"
 documentation = "https://docs.rs/gasket"
 license = "Apache-2.0"
-readme = "README.md"
+readme = "../README.md"
 authors = ["Santiago Carmuega <santiago@carmuega.me>"]
 
 [lib]
@@ -19,4 +19,4 @@ quote = "^1"
 syn = "^2"
 
 [dev-dependencies]
-gasket = { version = "0.4.0", path = "../gasket" }
+gasket = { version = "^0.4", path = "../gasket" }
