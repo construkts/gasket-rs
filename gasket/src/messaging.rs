@@ -277,14 +277,12 @@ where
 pub mod tokio {
     use super::*;
 
-    use ::tokio::sync::mpsc::{Receiver, Sender};
+    use ::tokio::sync;
 
-    pub struct ChannelSendAdapter<P>(Sender<Message<P>>);
-
-    impl<P> Clone for ChannelSendAdapter<P> {
-        fn clone(&self) -> Self {
-            Self(self.0.clone())
-        }
+    #[derive(Clone)]
+    pub enum ChannelSendAdapter<P> {
+        Mpsc(sync::mpsc::Sender<Message<P>>),
+        Broadcast(sync::broadcast::Sender<Message<P>>),
     }
 
     #[async_trait::async_trait]
@@ -293,21 +291,60 @@ pub mod tokio {
         P: Send + Sync,
     {
         async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
-            self.0.send(msg).await.map_err(|_| Error::SendError)
+            match self {
+                ChannelSendAdapter::Mpsc(x) => {
+                    x.send(msg).await.map_err(|_| Error::SendError)?;
+                }
+                ChannelSendAdapter::Broadcast(x) => {
+                    x.send(msg).map_err(|_| Error::SendError)?;
+                }
+            }
+
+            Ok(())
         }
     }
 
-    pub struct ChannelRecvAdapter<P>(Receiver<Message<P>>);
+    pub enum ChannelRecvAdapter<P> {
+        Mpsc(sync::mpsc::Receiver<Message<P>>),
+        Broadcast(sync::broadcast::Receiver<Message<P>>),
+    }
 
     #[async_trait::async_trait]
     impl<P> RecvAdapter<P> for ChannelRecvAdapter<P>
     where
-        P: Send + Sync,
+        P: Send + Sync + Clone,
     {
         async fn recv(&mut self) -> Result<Message<P>, Error> {
-            match self.0.recv().await {
-                Some(x) => Ok(x),
-                None => Err(Error::RecvError),
+            match self {
+                ChannelRecvAdapter::Mpsc(x) => match x.recv().await {
+                    Some(x) => Ok(x),
+                    None => Err(Error::RecvError),
+                },
+                ChannelRecvAdapter::Broadcast(x) => match x.recv().await {
+                    Ok(x) => Ok(x),
+                    Err(_) => Err(Error::RecvError),
+                },
+            }
+        }
+    }
+
+    impl<P> From<ChannelRecvAdapter<P>> for sync::broadcast::Receiver<Message<P>> {
+        fn from(value: ChannelRecvAdapter<P>) -> Self {
+            match value {
+                ChannelRecvAdapter::Broadcast(x) => x,
+                _ => panic!("only broadcast variant receivers can used"),
+            }
+        }
+    }
+
+    impl<P> Clone for ChannelRecvAdapter<P>
+    where
+        P: Clone,
+    {
+        fn clone(&self) -> Self {
+            match self {
+                Self::Broadcast(x) => Self::Broadcast(x.resubscribe()),
+                _ => panic!("only broadcast variant receivers can be cloned"),
             }
         }
     }
@@ -316,18 +353,38 @@ pub mod tokio {
     pub type InputPort<P> = super::InputPort<ChannelRecvAdapter<P>, P>;
     pub type MapSendAdapter<F, T> = super::MapSendAdapter<ChannelSendAdapter<T>, F, T>;
 
+    #[deprecated(note = "use mpsc_channel instead")]
     pub fn channel<P>(cap: usize) -> (ChannelSendAdapter<P>, ChannelRecvAdapter<P>) {
+        mpsc_channel(cap)
+    }
+
+    pub fn mpsc_channel<P>(cap: usize) -> (ChannelSendAdapter<P>, ChannelRecvAdapter<P>) {
         let (sender, receiver) = ::tokio::sync::mpsc::channel(cap);
-        (ChannelSendAdapter(sender), ChannelRecvAdapter(receiver))
+
+        (
+            ChannelSendAdapter::Mpsc(sender),
+            ChannelRecvAdapter::Mpsc(receiver),
+        )
+    }
+
+    pub fn broadcast_channel<P: Clone>(
+        cap: usize,
+    ) -> (ChannelSendAdapter<P>, ChannelRecvAdapter<P>) {
+        let (sender, receiver) = ::tokio::sync::broadcast::channel(cap);
+
+        (
+            ChannelSendAdapter::Broadcast(sender),
+            ChannelRecvAdapter::Broadcast(receiver),
+        )
     }
 
     pub fn connect_ports<O, I, P>(output: &mut O, input: &mut I, cap: usize)
     where
         O: SendPort<ChannelSendAdapter<P>, P>,
         I: RecvPort<ChannelRecvAdapter<P>, P>,
-        P: 'static + Send + Sync,
+        P: 'static + Send + Sync + Clone,
     {
-        let (sender, receiver) = channel::<P>(cap);
+        let (sender, receiver) = mpsc_channel::<P>(cap);
         output.connect(sender);
         input.connect(receiver);
     }
@@ -336,13 +393,28 @@ pub mod tokio {
     where
         O: SendPort<ChannelSendAdapter<P>, P>,
         I: RecvPort<ChannelRecvAdapter<P>, P>,
-        P: 'static + Send + Sync,
+        P: 'static + Send + Sync + Clone,
     {
-        let (sender, receiver) = channel::<P>(cap);
+        let (sender, receiver) = mpsc_channel::<P>(cap);
         input.connect(receiver);
 
         for output in outputs {
             output.connect(sender.clone());
+        }
+    }
+
+    pub fn broadcast_port<O, I, P>(output: &mut O, inputs: Vec<&mut I>, cap: usize)
+    where
+        O: SendPort<ChannelSendAdapter<P>, P>,
+        I: RecvPort<ChannelRecvAdapter<P>, P>,
+        P: 'static + Send + Sync + Clone,
+    {
+        let (sender, receiver) = broadcast_channel::<P>(cap);
+        output.connect(sender);
+
+        for input in inputs {
+            let rx2 = receiver.clone();
+            input.connect(rx2);
         }
     }
 }
