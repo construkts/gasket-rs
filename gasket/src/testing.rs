@@ -2,7 +2,7 @@ use crate::messaging::tokio::InputPort;
 
 pub async fn compare_inbound_sequence<M, I>(input: &mut InputPort<M>, expected: I)
 where
-    M: Send + Sync + PartialEq + std::fmt::Debug,
+    M: Send + Sync + PartialEq + std::fmt::Debug + Clone,
     I: IntoIterator<Item = M>,
 {
     for right in expected.into_iter() {
