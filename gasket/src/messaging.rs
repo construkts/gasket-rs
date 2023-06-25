@@ -328,13 +328,23 @@ pub mod tokio {
         }
     }
 
-    impl<P> TryFrom<ChannelRecvAdapter<P>> for sync::broadcast::Receiver<Message<P>> {
-        type Error = ();
-
-        fn try_from(value: ChannelRecvAdapter<P>) -> Result<Self, Self::Error> {
+    impl<P> From<ChannelRecvAdapter<P>> for sync::broadcast::Receiver<Message<P>> {
+        fn from(value: ChannelRecvAdapter<P>) -> Self {
             match value {
-                ChannelRecvAdapter::Broadcast(x) => Ok(x),
-                _ => Err(()),
+                ChannelRecvAdapter::Broadcast(x) => x,
+                _ => panic!("only broadcast variant receivers can used"),
+            }
+        }
+    }
+
+    impl<P> Clone for ChannelRecvAdapter<P>
+    where
+        P: Clone,
+    {
+        fn clone(&self) -> Self {
+            match self {
+                Self::Broadcast(x) => Self::Broadcast(x.resubscribe()),
+                _ => panic!("only broadcast variant receivers can be cloned"),
             }
         }
     }
@@ -390,6 +400,21 @@ pub mod tokio {
 
         for output in outputs {
             output.connect(sender.clone());
+        }
+    }
+
+    pub fn broadcast_port<O, I, P>(output: &mut O, inputs: Vec<&mut I>, cap: usize)
+    where
+        O: SendPort<ChannelSendAdapter<P>, P>,
+        I: RecvPort<ChannelRecvAdapter<P>, P>,
+        P: 'static + Send + Sync + Clone,
+    {
+        let (sender, receiver) = broadcast_channel::<P>(cap);
+        output.connect(sender);
+
+        for input in inputs {
+            let rx2 = receiver.clone();
+            input.connect(rx2);
         }
     }
 }
