@@ -53,9 +53,11 @@ impl Retry {
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct Policy {
     pub max_retries: usize,
+    #[serde(rename(deserialize = "backoff_unit_sec"))]
     #[serde(deserialize_with = "deserialize_duration")]
     pub backoff_unit: Duration,
     pub backoff_factor: u32,
+    #[serde(rename(deserialize = "max_backoff_sec"))]
     #[serde(deserialize_with = "deserialize_duration")]
     pub max_backoff: Duration,
     pub dismissible: bool,
