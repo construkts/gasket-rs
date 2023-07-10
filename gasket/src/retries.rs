@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
 use std::{ops::Mul, time::Duration};
 use tracing::debug;
 
@@ -53,12 +53,15 @@ impl Retry {
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct Policy {
     pub max_retries: usize,
+    #[serde(rename(deserialize = "backoff_unit_sec"))]
+    #[serde(deserialize_with = "deserialize_duration")]
     pub backoff_unit: Duration,
     pub backoff_factor: u32,
+    #[serde(rename(deserialize = "max_backoff_sec"))]
+    #[serde(deserialize_with = "deserialize_duration")]
     pub max_backoff: Duration,
     pub dismissible: bool,
 }
-
 impl Policy {
     pub fn no_retry() -> Self {
         Self {
@@ -75,4 +78,27 @@ fn compute_backoff_delay(policy: &Policy, retry: usize) -> Duration {
     let units = policy.backoff_factor.pow(retry as u32);
     let backoff = policy.backoff_unit.mul(units);
     core::cmp::min(backoff, policy.max_backoff)
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_map(DurationVisitor)
+}
+
+struct DurationVisitor;
+impl<'de> Visitor<'de> for DurationVisitor {
+    type Value = Duration;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("This Visitor expects to receive i64 seconds")
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Duration::from_secs(v as u64))
+    }
 }
