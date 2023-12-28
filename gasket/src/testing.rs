@@ -1,4 +1,4 @@
-use crate::messaging::tokio::InputPort;
+use crate::messaging::InputPort;
 
 pub async fn compare_inbound_sequence<M, I>(input: &mut InputPort<M>, expected: I)
 where
