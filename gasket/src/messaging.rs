@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, marker::PhantomData};
+use std::collections::VecDeque;
 
 use crate::error::Error;
 
@@ -29,43 +29,15 @@ pub trait SendAdapter<P>: Send + Sync {
     async fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
 }
 
-pub trait SendPort<A, P>
-where
-    A: SendAdapter<P>,
-{
-    fn connect(&mut self, adapter: A);
+pub struct OutputPort<P> {
+    sender: Option<Box<dyn SendAdapter<P>>>,
 }
 
-pub struct OutputPort<A, P> {
-    sender: Option<A>,
-    _phantom: PhantomData<P>,
-}
-
-impl<A, P> Clone for OutputPort<A, P>
-where
-    A: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            _phantom: self._phantom,
-        }
+impl<P> OutputPort<P> {
+    fn connect(&mut self, adapter: impl SendAdapter<P> + 'static) {
+        self.sender = Some(Box::new(adapter));
     }
-}
 
-impl<A, P> Default for OutputPort<A, P> {
-    fn default() -> Self {
-        Self {
-            sender: None,
-            _phantom: Default::default(),
-        }
-    }
-}
-
-impl<A, P> OutputPort<A, P>
-where
-    A: SendAdapter<P>,
-{
     pub async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
         match &mut self.sender {
             Some(sender) => sender.send(msg).await,
@@ -74,28 +46,25 @@ where
     }
 }
 
-impl<A, P> SendPort<A, P> for OutputPort<A, P>
-where
-    A: SendAdapter<P>,
-{
-    fn connect(&mut self, adapter: A) {
-        self.sender = Some(adapter);
+impl<P> Default for OutputPort<P> {
+    fn default() -> Self {
+        Self { sender: None }
     }
 }
 
-pub struct FanoutPort<A, P>
-where
-    A: Clone,
-{
-    senders: Vec<A>,
-    _phantom: PhantomData<P>,
+#[derive(Default)]
+pub struct Fanout<P> {
+    senders: Vec<OutputPort<P>>,
 }
 
-impl<A, P> FanoutPort<A, P>
+impl<P> Fanout<P>
 where
-    A: SendAdapter<P> + Clone,
     P: Clone,
 {
+    pub fn new(&mut self, mut ports: Vec<OutputPort<P>>) {
+        self.senders.append(&mut ports);
+    }
+
     pub async fn send(&mut self, msg: Message<P>) -> Result<(), Error> {
         if self.senders.is_empty() {
             return Err(Error::NotConnected);
@@ -109,89 +78,39 @@ where
     }
 }
 
-impl<A, P> SendPort<A, P> for FanoutPort<A, P>
-where
-    A: SendAdapter<P> + Clone,
-{
-    fn connect(&mut self, adapter: A) {
-        self.senders.push(adapter);
-    }
-}
-
-impl<A, P> Default for FanoutPort<A, P>
-where
-    A: SendAdapter<P> + Clone,
-{
-    fn default() -> Self {
-        Self {
-            senders: Vec::new(),
-            _phantom: Default::default(),
-        }
-    }
-}
-
 #[async_trait::async_trait]
-pub trait RecvAdapter<P>: Send + Sync {
+pub trait RecvAdapter<P>: Send + Sync
+where
+    P: Send + Sync + Clone,
+{
     async fn recv(&mut self) -> Result<Message<P>, Error>;
 }
 
-pub trait RecvPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
-    fn connect(&mut self, adapter: A);
+pub struct InputPort<P> {
+    receiver: Option<Box<dyn RecvAdapter<P>>>,
 }
 
-pub struct InputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
-    receiver: Option<A>,
-    _phantom: PhantomData<P>,
-}
-
-impl<A, P> Default for InputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
+impl<P> Default for InputPort<P> {
     fn default() -> Self {
         Self {
             receiver: Default::default(),
-            _phantom: Default::default(),
         }
     }
 }
 
-impl<A, P> Clone for InputPort<A, P>
+impl<P> InputPort<P>
 where
-    A: RecvAdapter<P> + Clone,
+    P: Send + Sync + Clone,
 {
-    fn clone(&self) -> Self {
-        Self {
-            receiver: self.receiver.clone(),
-            _phantom: self._phantom,
-        }
+    fn connect(&mut self, adapter: impl Sized + RecvAdapter<P> + 'static) {
+        self.receiver = Some(Box::new(adapter));
     }
-}
 
-impl<A, P> InputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
     pub async fn recv(&mut self) -> Result<Message<P>, Error> {
         let receiver = self.receiver.as_mut().ok_or(Error::NotConnected)?;
         let msg = receiver.recv().await?;
 
         Ok(msg)
-    }
-}
-
-impl<A, P> RecvPort<A, P> for InputPort<A, P>
-where
-    A: RecvAdapter<P>,
-{
-    fn connect(&mut self, adapter: A) {
-        self.receiver = Some(adapter);
     }
 }
 
@@ -239,31 +158,17 @@ impl<P> SinkAdapter<P> {
     }
 }
 
-pub struct MapSendAdapter<I, F, T>
-where
-    I: SendAdapter<T>,
-{
-    inner: I,
-    mapper: fn(F) -> Option<T>,
+pub struct OutputMap<In, Out> {
+    mapper: fn(In) -> Option<Out>,
+    inner: OutputPort<Out>,
 }
 
-impl<I, F, T> MapSendAdapter<I, F, T>
-where
-    I: SendAdapter<T>,
-{
-    pub fn new(inner: I, mapper: fn(F) -> Option<T>) -> Self {
+impl<In, Out> OutputMap<In, Out> {
+    pub fn new(inner: OutputPort<Out>, mapper: fn(In) -> Option<Out>) -> Self {
         Self { inner, mapper }
     }
-}
 
-#[async_trait::async_trait]
-impl<I, F, T> SendAdapter<F> for MapSendAdapter<I, F, T>
-where
-    I: SendAdapter<T> + Send,
-    F: Send,
-    T: Send,
-{
-    async fn send(&mut self, msg: Message<F>) -> Result<(), Error> {
+    pub async fn send(&mut self, msg: Message<In>) -> Result<(), Error> {
         let out = (self.mapper)(msg.payload);
 
         if let Some(payload) = out {
@@ -349,10 +254,6 @@ pub mod tokio {
         }
     }
 
-    pub type OutputPort<P> = super::OutputPort<ChannelSendAdapter<P>, P>;
-    pub type InputPort<P> = super::InputPort<ChannelRecvAdapter<P>, P>;
-    pub type MapSendAdapter<F, T> = super::MapSendAdapter<ChannelSendAdapter<T>, F, T>;
-
     #[deprecated(note = "use mpsc_channel instead")]
     pub fn channel<P>(cap: usize) -> (ChannelSendAdapter<P>, ChannelRecvAdapter<P>) {
         mpsc_channel(cap)
@@ -378,21 +279,17 @@ pub mod tokio {
         )
     }
 
-    pub fn connect_ports<O, I, P>(output: &mut O, input: &mut I, cap: usize)
+    pub fn connect_ports<P>(output: &mut OutputPort<P>, input: &mut InputPort<P>, cap: usize)
     where
-        O: SendPort<ChannelSendAdapter<P>, P>,
-        I: RecvPort<ChannelRecvAdapter<P>, P>,
-        P: 'static + Send + Sync + Clone,
+        P: Send + Sync + Clone + 'static,
     {
         let (sender, receiver) = mpsc_channel::<P>(cap);
         output.connect(sender);
         input.connect(receiver);
     }
 
-    pub fn funnel_ports<O, I, P>(outputs: Vec<&mut O>, input: &mut I, cap: usize)
+    pub fn funnel_ports<P>(outputs: Vec<&mut OutputPort<P>>, input: &mut InputPort<P>, cap: usize)
     where
-        O: SendPort<ChannelSendAdapter<P>, P>,
-        I: RecvPort<ChannelRecvAdapter<P>, P>,
         P: 'static + Send + Sync + Clone,
     {
         let (sender, receiver) = mpsc_channel::<P>(cap);
@@ -403,10 +300,8 @@ pub mod tokio {
         }
     }
 
-    pub fn broadcast_port<O, I, P>(output: &mut O, inputs: Vec<&mut I>, cap: usize)
+    pub fn broadcast_port<P>(output: &mut OutputPort<P>, inputs: Vec<&mut InputPort<P>>, cap: usize)
     where
-        O: SendPort<ChannelSendAdapter<P>, P>,
-        I: RecvPort<ChannelRecvAdapter<P>, P>,
         P: 'static + Send + Sync + Clone,
     {
         let (sender, receiver) = broadcast_channel::<P>(cap);
