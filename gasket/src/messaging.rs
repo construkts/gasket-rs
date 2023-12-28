@@ -114,6 +114,66 @@ where
     }
 }
 
+struct RunningTimer {
+    thread: ::tokio::task::JoinHandle<()>,
+    recv: ::tokio::sync::watch::Receiver<std::time::Instant>,
+}
+
+impl RunningTimer {
+    pub fn start(interval: std::time::Duration) -> Self {
+        let (send, recv) = ::tokio::sync::watch::channel(std::time::Instant::now());
+
+        let thread = ::tokio::spawn(async move {
+            loop {
+                ::tokio::time::sleep(interval).await;
+                let res = send.send(std::time::Instant::now());
+                if let Err(err) = res {
+                    tracing::warn!(?err, "timer send error");
+                    break;
+                }
+            }
+        });
+
+        RunningTimer { recv, thread }
+    }
+}
+
+pub struct TimerPort {
+    interval: std::time::Duration,
+    running: Option<RunningTimer>,
+}
+
+impl TimerPort {
+    pub fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            running: None,
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(running) = self.running.take() {
+            running.thread.abort();
+        }
+    }
+
+    pub fn from_secs(secs: u64) -> Self {
+        Self::new(std::time::Duration::from_secs(secs))
+    }
+
+    pub async fn recv(&mut self) -> Result<std::time::Instant, Error> {
+        if self.running.is_none() {
+            let running = RunningTimer::start(self.interval.clone());
+            self.running = Some(running);
+        }
+
+        let running = self.running.as_mut().ok_or(Error::NotConnected)?;
+
+        running.recv.changed().await.map_err(|_| Error::RecvError)?;
+        Ok(running.recv.borrow().clone())
+    }
+}
+
 pub struct SinkAdapter<P> {
     cap: Option<usize>,
     buffer: VecDeque<Message<P>>,
@@ -310,6 +370,31 @@ pub mod tokio {
         for input in inputs {
             let rx2 = receiver.clone();
             input.connect(rx2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use crate::messaging::TimerPort;
+
+    #[::tokio::test]
+    #[ignore = "not ready"]
+    async fn test_timer_port() {
+        let mut input = TimerPort::new(Duration::from_secs(2));
+
+        let start = Instant::now();
+
+        loop {
+            let timer = input.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2300)).await;
+            println!(
+                "timer: {}, elapsed: {}",
+                timer.elapsed().as_secs(),
+                start.elapsed().as_secs()
+            );
         }
     }
 }
