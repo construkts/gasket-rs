@@ -1,6 +1,6 @@
 [package]
 name = "gasket-derive"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Staged Event-Driven Architecture (SEDA) framework"
 repository = "https://github.com/construkts/gasket-rs"
@@ -19,4 +19,4 @@ quote = "^1"
 syn = "^2"
 
 [dev-dependencies]
-gasket = { version = "^0.5", path = "../gasket" }
+gasket = { path = "../gasket" }

@@ -1,6 +1,6 @@
 [package]
 name = "gasket"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Staged Event-Driven Architecture (SEDA) framework"
 repository = "https://github.com/construkts/gasket-rs"
@@ -18,7 +18,7 @@ serde = { version = "1.0.160", features = ["derive"] }
 thiserror = "1.0.30"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tracing = "0.1.37"
-gasket-derive = { version = "0.5.0", path = "../gasket-derive", optional = true }
+gasket-derive = { version = "0.6.0", path = "../gasket-derive", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.16"
