@@ -34,7 +34,7 @@ pub struct OutputPort<P> {
 }
 
 impl<P> OutputPort<P> {
-    fn connect(&mut self, adapter: impl SendAdapter<P> + 'static) {
+    pub fn connect(&mut self, adapter: impl SendAdapter<P> + 'static) {
         self.sender = Some(Box::new(adapter));
     }
 
@@ -102,7 +102,7 @@ impl<P> InputPort<P>
 where
     P: Send + Sync + Clone,
 {
-    fn connect(&mut self, adapter: impl Sized + RecvAdapter<P> + 'static) {
+    pub fn connect(&mut self, adapter: impl Sized + RecvAdapter<P> + 'static) {
         self.receiver = Some(Box::new(adapter));
     }
 
