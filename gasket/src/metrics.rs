@@ -28,6 +28,10 @@ impl Registry {
             _ => unreachable!(),
         }
     }
+
+    pub fn entries(&self) -> std::collections::hash_map::Iter<'_, &str, Metric> {
+        self.0.iter()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
