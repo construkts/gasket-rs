@@ -1,6 +1,6 @@
 [package]
 name = "gasket-prometheus"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Prometheus metric exporter for the Gasket framework"
 repository = "https://github.com/construkts/gasket-rs"
@@ -11,5 +11,5 @@ readme = "../README.md"
 authors = ["Santiago Carmuega <santiago@carmuega.me>"]
 
 [dependencies]
-gasket = { path = "../gasket" }
+gasket = { version = "0.7.0", path = "../gasket" }
 prometheus_exporter_base = { version = "1.4.0", features = ["hyper_server"] }
