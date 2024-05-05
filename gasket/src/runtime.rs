@@ -352,6 +352,7 @@ impl Anchor {
     }
 }
 
+#[derive(Debug)]
 pub struct Tether {
     name: String,
     anchor_ref: Weak<Anchor>,
@@ -428,7 +429,7 @@ impl Tether {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Policy {
     pub tick_timeout: Option<Duration>,
     pub bootstrap_retry: retries::Policy,

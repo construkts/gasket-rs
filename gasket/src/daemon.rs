@@ -4,10 +4,15 @@ use tracing::info;
 
 use crate::runtime::{StagePhase, Tether, TetherState};
 
+#[derive(Debug)]
 pub struct Daemon(pub Vec<Tether>);
 
 impl Daemon {
-    fn should_stop(&self) -> bool {
+    pub fn tethers(&self) -> impl Iterator<Item = &Tether> {
+        self.0.iter()
+    }
+
+    pub fn should_stop(&self) -> bool {
         self.0.iter().any(|tether| match tether.check_state() {
             TetherState::Alive(p) => {
                 matches!(p, StagePhase::Ended)
@@ -16,7 +21,7 @@ impl Daemon {
         })
     }
 
-    fn teardown(&self) {
+    pub fn teardown(&self) {
         for tether in self.0.iter() {
             let state = tether.check_state();
             info!(stage = tether.name(), ?state, "dismissing stage");
