@@ -19,6 +19,7 @@ thiserror = "1.0.30"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tracing = "0.1.37"
 gasket-derive = { version = "0.7.0", path = "../gasket-derive", optional = true }
+signal-hook = "0.3.17"
 
 [dev-dependencies]
 tracing-subscriber = "0.3.16"
