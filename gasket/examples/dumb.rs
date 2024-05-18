@@ -204,7 +204,7 @@ fn main() {
     let tether1 = spawn_stage(
         ticker1,
         Policy {
-            tick_timeout: Some(Duration::from_secs(3)),
+            tick_timeout: Some(Duration::from_secs(10)),
             bootstrap_retry: retries::Policy::no_retry(),
             work_retry: retries::Policy::no_retry(),
             teardown_retry: retries::Policy::no_retry(),
@@ -214,7 +214,7 @@ fn main() {
     let tether2 = spawn_stage(
         ticker2,
         Policy {
-            tick_timeout: Some(Duration::from_secs(3)),
+            tick_timeout: Some(Duration::from_secs(10)),
             bootstrap_retry: retries::Policy::no_retry(),
             work_retry: retries::Policy::no_retry(),
             teardown_retry: retries::Policy::no_retry(),
@@ -233,37 +233,18 @@ fn main() {
 
     let tethers = vec![tether1, tether2, tether3];
 
-    for i in 0..10 {
-        for tether in tethers.iter() {
-            match tether.check_state() {
-                gasket::runtime::TetherState::Dropped => println!("tether dropped"),
-                gasket::runtime::TetherState::Blocked(x) => {
-                    println!("tether blocked, last state: {x:?}")
-                }
-                gasket::runtime::TetherState::Alive(x) => {
-                    println!("tether alive, last state: {x:?}")
-                }
-            }
+    let pipeline = gasket::daemon::Daemon::new(tethers);
+    pipeline.block();
 
-            match tether.read_metrics() {
-                Ok(readings) => {
-                    for (key, value) in readings {
-                        println!("{key}: {value:?}");
-                    }
-                }
-                Err(err) => {
-                    println!("couldn't read metrics");
-                    dbg!(err);
-                }
-            }
-        }
-
-        std::thread::sleep(Duration::from_secs(5));
-        println!("check loop {i}");
-    }
-
-    for tether in tethers {
-        tether.dismiss_stage().expect("stage stops");
-        tether.join_stage();
-    }
+    // match tether.read_metrics() {
+    //     Ok(readings) => {
+    //         for (key, value) in readings {
+    //             println!("{key}: {value:?}");
+    //         }
+    //     }
+    //     Err(err) => {
+    //         println!("couldn't read metrics");
+    //         dbg!(err);
+    //     }
+    // }
 }
