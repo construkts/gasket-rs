@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::runtime::{StagePhase, Tether, TetherState};
 
@@ -61,7 +61,12 @@ impl Daemon {
         for tether in self.0.iter() {
             let state = tether.check_state();
             info!(stage = tether.name(), ?state, "dismissing stage");
-            tether.dismiss_stage().expect("stage stops");
+
+            match tether.dismiss_stage() {
+                Ok(_) => (),
+                Err(crate::error::Error::TetherDropped) => debug!("stage already dismissed"),
+                error => warn!(?error, "couldn't dismiss stage"),
+            }
         }
 
         // second pass is to wait for graceful shutdown
