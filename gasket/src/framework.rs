@@ -95,18 +95,33 @@ where
     /// Bootstrap a new worker
     ///
     /// It's responsible for initializing any resources needed by the worker.
+    ///
+    /// This future will be cancelled if the stage is requested to shut-down.
+    /// The implementation of this function needs to be _cancellation
+    /// safe_. Don't rely on state that crosses await points to avoid potential
+    /// data loss.
     async fn bootstrap(stage: &S) -> Result<Self>;
 
     /// Schedule the next work unit for execution
     ///
     /// This usually means reading messages from input ports and returning a
     /// work unit that contains all data required for execution.
+    ///
+    /// This future will be cancelled if the stage is requested to shut-down.
+    /// The implementation of this function needs to be _cancellation safe_.
+    /// Don't rely on state that crosses await points to avoid potential data
+    /// loss.
     async fn schedule(&mut self, stage: &mut S) -> Result<WorkSchedule<S::Unit>>;
 
     /// Execute the action described by the work unit
     ///
     /// This usually means doing required computation, generating side-effect
     /// and submitting message through the output ports
+    ///
+    /// This future will be cancelled if the stage is requested to shut-down.
+    /// The implementation of this function needs to be _cancellation safe_.
+    /// Don't rely on state that crosses await points to avoid potential data
+    /// loss.
     async fn execute(&mut self, unit: &S::Unit, stage: &mut S) -> Result<()>;
 
     /// Shutdown the worker gracefully
