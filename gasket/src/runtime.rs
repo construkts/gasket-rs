@@ -151,36 +151,42 @@ where
     #[instrument(level = Level::INFO, skip_all)]
     async fn bootstrap(&self, retry: Retry) -> StageEvent<S> {
         retry
-            .wait_backoff(
-                &self.policy.bootstrap_retry,
-                self.anchor.dismissed_rx.clone(),
-            )
+            .wait_backoff(&self.policy.bootstrap_retry, self.anchor.dismissed.clone())
             .await;
 
-        match S::Worker::bootstrap(&self.stage).await {
-            Ok(w) => StageEvent::BootstrapOk(w),
-            Err(x) => StageEvent::BootstrapError(x, retry),
+        tokio::select! {
+            _ = self.anchor.dismissed.cancelled() => {
+                StageEvent::TeardownOk(true)
+            }
+            bootstrap = S::Worker::bootstrap(&self.stage) => {
+                match bootstrap {
+                    Ok(w) => StageEvent::BootstrapOk(w),
+                    Err(x) => StageEvent::BootstrapError(x, retry),
+                }
+            }
         }
     }
 
     #[instrument(level = Level::INFO, skip_all)]
     async fn schedule(&mut self, mut worker: S::Worker, retry: Retry) -> StageEvent<S> {
         retry
-            .wait_backoff(
-                &self.policy.teardown_retry,
-                self.anchor.dismissed_rx.clone(),
-            )
+            .wait_backoff(&self.policy.teardown_retry, self.anchor.dismissed.clone())
             .await;
 
-        let schedule = match worker.schedule(&mut self.stage).await {
-            Ok(x) => x,
-            Err(x) => return StageEvent::ScheduleError(worker, x, retry),
-        };
-
-        match schedule {
-            WorkSchedule::Idle => StageEvent::WorkerIdle(worker),
-            WorkSchedule::Done => StageEvent::WorkerDone(worker),
-            WorkSchedule::Unit(u) => StageEvent::NextUnit(worker, u),
+        tokio::select! {
+            _ = self.anchor.dismissed.cancelled() => {
+                StageEvent::Dismissed(worker)
+            }
+            schedule = worker.schedule(&mut self.stage) => {
+                match schedule {
+                    Ok(x) => match x {
+                        WorkSchedule::Idle => StageEvent::WorkerIdle(worker),
+                        WorkSchedule::Done => StageEvent::WorkerDone(worker),
+                        WorkSchedule::Unit(u) => StageEvent::NextUnit(worker, u),
+                    },
+                    Err(x) => StageEvent::ScheduleError(worker, x, retry),
+                }
+            }
         }
     }
 
@@ -192,15 +198,19 @@ where
         retry: Retry,
     ) -> StageEvent<S> {
         retry
-            .wait_backoff(
-                &self.policy.teardown_retry,
-                self.anchor.dismissed_rx.clone(),
-            )
+            .wait_backoff(&self.policy.teardown_retry, self.anchor.dismissed.clone())
             .await;
 
-        match worker.execute(&unit, &mut self.stage).await {
-            Ok(_) => StageEvent::ExecuteOk(worker),
-            Err(err) => StageEvent::ExecuteError(worker, unit, err, retry),
+        tokio::select! {
+            _ = self.anchor.dismissed.cancelled() => {
+                return StageEvent::Dismissed(worker);
+            }
+            execute = worker.execute(&unit, &mut self.stage) => {
+                match execute {
+                    Ok(_) => StageEvent::ExecuteOk(worker),
+                    Err(err) => StageEvent::ExecuteError(worker, unit, err, retry),
+                }
+            }
         }
     }
 
@@ -212,10 +222,7 @@ where
         ended: Ended,
     ) -> StageEvent<S> {
         retry
-            .wait_backoff(
-                &self.policy.teardown_retry,
-                self.anchor.dismissed_rx.clone(),
-            )
+            .wait_backoff(&self.policy.teardown_retry, self.anchor.dismissed.clone())
             .await;
 
         match worker.teardown().await {
@@ -225,18 +232,6 @@ where
     }
 
     async fn actuate(&mut self, prev_state: StageState<S>) -> StageEvent<S> {
-        {
-            // if stage is dismissed, return early
-            if *self.anchor.dismissed_rx.borrow() {
-                match prev_state {
-                    StageState::Bootstrap(..) => return StageEvent::TeardownOk(true),
-                    StageState::Scheduling(w, ..) => return StageEvent::Dismissed(w),
-                    StageState::Executing(w, _, _) => return StageEvent::Dismissed(w),
-                    _ => (),
-                };
-            }
-        }
-
         match prev_state {
             StageState::Bootstrap(retry) => self.bootstrap(retry).await,
             StageState::Scheduling(worker, retry) => self.schedule(worker, retry).await,
@@ -324,29 +319,23 @@ where
 /// Sentinel object that lives within the thread of the stage
 pub struct Anchor {
     metrics: metrics::Registry,
-    dismissed_rx: tokio::sync::watch::Receiver<bool>,
-    dismissed_tx: tokio::sync::watch::Sender<bool>,
+    dismissed: tokio_util::sync::CancellationToken,
     last_state: AtomicCell<StagePhase>,
     last_tick: AtomicCell<Instant>,
 }
 
 impl Anchor {
     fn new(metrics: metrics::Registry) -> Self {
-        let (dismissed_tx, dismissed_rx) = tokio::sync::watch::channel(false);
-
         Self {
             metrics,
-            dismissed_rx,
-            dismissed_tx,
+            dismissed: tokio_util::sync::CancellationToken::new(),
             last_tick: AtomicCell::new(Instant::now()),
             last_state: AtomicCell::new(StagePhase::Bootstrap),
         }
     }
 
     fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
-        self.dismissed_tx
-            .send(true)
-            .map_err(|_| crate::error::Error::TetherDropped)?;
+        self.dismissed.cancel();
 
         Ok(())
     }
