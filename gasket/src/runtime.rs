@@ -335,6 +335,7 @@ impl Anchor {
     }
 
     fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
+        println!("cancelling stage");
         self.dismissed.cancel();
 
         Ok(())
@@ -367,7 +368,7 @@ impl Tether {
             .expect("called from outside thread");
     }
 
-    fn try_anchor(&self) -> Result<Arc<Anchor>, crate::error::Error> {
+    pub fn try_anchor(&self) -> Result<Arc<Anchor>, crate::error::Error> {
         match self.anchor_ref.upgrade() {
             Some(anchor) => Ok(anchor),
             None => Err(crate::error::Error::TetherDropped),
@@ -478,11 +479,15 @@ where
 
 #[cfg(test)]
 pub mod tests {
+    use approx::assert_abs_diff_eq;
+
     use super::*;
 
     #[derive(Clone, Default)]
     pub struct MockStage {
         failures: Vec<bool>,
+        schedule_delay: Option<Duration>,
+        execute_delay: Option<Duration>,
     }
 
     impl Stage for MockStage {
@@ -529,9 +534,13 @@ pub mod tests {
 
         async fn schedule(
             &mut self,
-            _: &mut MockStage,
+            stage: &mut MockStage,
         ) -> Result<WorkSchedule<usize>, WorkerError> {
             self.schedule_count += 1;
+
+            if let Some(delay) = stage.schedule_delay {
+                tokio::time::sleep(delay).await;
+            }
 
             Ok(WorkSchedule::Unit(self.schedule_count))
         }
@@ -539,11 +548,15 @@ pub mod tests {
         async fn execute(
             &mut self,
             unit: &usize,
-            config: &mut MockStage,
+            stage: &mut MockStage,
         ) -> Result<(), WorkerError> {
             self.execute_count += 1;
 
-            match self.should_fail(*unit, config) {
+            if let Some(delay) = stage.execute_delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.should_fail(*unit, stage) {
                 true => Err(WorkerError::Retry),
                 false => Ok(()),
             }
@@ -605,6 +618,7 @@ pub mod tests {
     async fn honors_max_retries() {
         let config = MockStage {
             failures: vec![true],
+            ..Default::default()
         };
 
         let metrics = metrics::Registry::default();
@@ -674,36 +688,33 @@ pub mod tests {
     //     assert!(elapsed.as_millis() <= 2250);
     // }
 
-    // #[tokio::test]
-    // async fn honors_cancel() {
-    //     let mut u1 = FailingUnit {
-    //         attempt: 0,
-    //         delay: None,
-    //     };
+    #[tokio::test(flavor = "multi_thread")]
+    async fn honors_cancel_in_time() {
+        let expected_shutdown = Duration::from_millis(1_000);
 
-    //     let policy = Policy {
-    //         max_retries: 100,
-    //         backoff_unit: Duration::from_millis(2000),
-    //         backoff_factor: 2,
-    //         max_backoff: Duration::MAX,
-    //     };
+        let stage = MockStage {
+            schedule_delay: Some(expected_shutdown.mul_f64(10.0)),
+            execute_delay: Some(expected_shutdown.mul_f64(10.0)),
+            ..Default::default()
+        };
 
-    //     let start = std::time::Instant::now();
-    //     let cancel = Arc::new(AtomicCell::new(false));
+        let start = std::time::Instant::now();
+        let tether = super::spawn_stage(stage, Policy::default());
 
-    //     let cancel2 = cancel.clone();
-    //     std::thread::spawn(move || {
-    //         std::thread::sleep(Duration::from_millis(500));
-    //         cancel2.store(true);
-    //     });
+        let anchor = tether.try_anchor().unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(expected_shutdown).await;
+            anchor.dismiss_stage().unwrap();
+        });
 
-    //     let result = retry_unit(&mut u1, &policy, Some(&cancel)).await;
-    //     let elapsed = start.elapsed();
+        tether.join_stage();
 
-    //     assert!(result.is_err());
+        let elapsed = start.elapsed();
 
-    //     // not an exact science, should be 2046, adding +/- 10%
-    //     assert!(elapsed.as_millis() >= 450);
-    //     assert!(elapsed.as_millis() <= 550);
-    // }
+        assert_abs_diff_eq!(
+            elapsed.as_secs_f64(),
+            expected_shutdown.as_secs_f64(),
+            epsilon = 0.01
+        );
+    }
 }
