@@ -25,11 +25,7 @@ impl Retry {
         self.maxed(policy) && policy.dismissible
     }
 
-    pub async fn wait_backoff(
-        &self,
-        policy: &Policy,
-        mut cancel: tokio::sync::watch::Receiver<bool>,
-    ) {
+    pub async fn wait_backoff(&self, policy: &Policy, cancel: tokio_util::sync::CancellationToken) {
         let num = match &self.0 {
             Some(x) => x,
             None => return,
@@ -44,7 +40,7 @@ impl Retry {
         );
 
         tokio::select! {
-            _ = cancel.changed() => (),
+            _ = cancel.cancelled() => (),
             _ = tokio::time::sleep(backoff) => ()
         }
     }
@@ -62,6 +58,7 @@ pub struct Policy {
     pub max_backoff: Duration,
     pub dismissible: bool,
 }
+
 impl Policy {
     pub fn no_retry() -> Self {
         Self {
