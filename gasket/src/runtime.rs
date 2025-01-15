@@ -5,7 +5,7 @@ use std::{
 };
 
 use crossbeam::{atomic::AtomicCell, utils::Backoff};
-use tracing::{error, info, instrument, trace, warn, Level};
+use tracing::{debug, error, info, instrument, trace, warn, Level};
 
 use crate::metrics;
 use crate::retries;
@@ -304,7 +304,7 @@ where
         let next_phase = StagePhase::from(&next_state);
 
         if prev_phase != next_phase {
-            info!(?prev_phase, ?next_phase, "switching stage phase");
+            debug!(?prev_phase, ?next_phase, "switching stage phase");
         }
 
         self.state = Some(next_state);
