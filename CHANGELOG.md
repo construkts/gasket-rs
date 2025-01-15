@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 ### ⚙️ Miscellaneous Tasks
 
 - Automate changelog generation (#28)
+- Configure release procedure
 
 ## [0.8.0] - 2024-05-18
 
