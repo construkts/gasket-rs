@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [0.9.0] - 2025-01-15
 
 ### 🚀 Features
 
@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 
 - Don't panic on stages already dismissed (#23)
 - Downgrade phase change log level (#27)
+
+### ⚙️ Miscellaneous Tasks
+
+- Automate changelog generation (#28)
 
 ## [0.8.0] - 2024-05-18
 

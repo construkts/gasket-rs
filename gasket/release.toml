@@ -1,0 +1,6 @@
+
+
+push = false
+publish = false
+shared-version = true
+pre-release-hook = ["git", "cliff", "-w", "../", "-o", "../CHANGELOG.md", "--tag", "{{version}}"]
