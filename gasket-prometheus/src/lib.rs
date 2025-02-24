@@ -34,7 +34,7 @@ fn write_gauge(output: &mut impl Write, stage: &str, metric: &str, value: i64) {
 
     let mut pc = PrometheusMetric::build()
         .with_name(&name)
-        .with_metric_type(MetricType::Counter)
+        .with_metric_type(MetricType::Gauge)
         .with_help(&help)
         .build();
 
