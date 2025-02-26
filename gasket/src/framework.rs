@@ -6,8 +6,8 @@ use tracing::{error, warn};
 #[cfg(feature = "derive")]
 pub use gasket_derive::*;
 
-pub trait Stage: Sized + Send {
-    type Unit;
+pub trait Stage: Sized + Send + Sync {
+    type Unit: Send + Sync;
     type Worker: Worker<Self>;
 
     fn name(&self) -> &str;
@@ -37,7 +37,7 @@ pub enum WorkerError {
 
 type Result<T> = core::result::Result<T, WorkerError>;
 
-pub trait AsWorkError<T> {
+pub trait AsWorkError<T>: Send + Sync {
     fn or_panic(self) -> Result<T>;
     fn or_retry(self) -> Result<T>;
     fn or_restart(self) -> Result<T>;
@@ -45,7 +45,8 @@ pub trait AsWorkError<T> {
 
 impl<T, E> AsWorkError<T> for core::result::Result<T, E>
 where
-    E: Display,
+    T: Send + Sync,
+    E: Send + Sync + Display,
 {
     fn or_panic(self) -> Result<T> {
         match self {
@@ -87,8 +88,8 @@ pub enum WorkSchedule<U> {
     Done,
 }
 
-#[async_trait::async_trait(?Send)]
-pub trait Worker<S>: Sized
+#[async_trait::async_trait]
+pub trait Worker<S>: Send + Sync + Sized
 where
     S: Stage,
 {

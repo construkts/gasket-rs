@@ -56,6 +56,7 @@ impl Daemon {
         false
     }
 
+    #[cfg(feature = "threaded")]
     pub fn teardown(self) {
         // first pass is to notify that we should stop
         for tether in self.0.iter() {
@@ -76,6 +77,37 @@ impl Daemon {
         }
     }
 
+    #[cfg(not(feature = "threaded"))]
+    pub async fn teardown(self) {
+        // first pass is to notify that we should stop
+        for tether in self.0.iter() {
+            let state = tether.check_state();
+            info!(stage = tether.name(), ?state, "dismissing stage");
+
+            match tether.dismiss_stage() {
+                Ok(_) => (),
+                Err(crate::error::Error::TetherDropped) => debug!("stage already dismissed"),
+                error => warn!(?error, "couldn't dismiss stage"),
+            }
+        }
+
+        // second pass is to wait for graceful shutdown
+        info!("waiting for stages to end");
+        for tether in self.0.into_iter() {
+            tether.join_stage().await;
+        }
+    }
+
+    #[cfg(not(feature = "threaded"))]
+    pub async fn block(self) {
+        while !self.should_stop() {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+
+        self.teardown().await;
+    }
+
+    #[cfg(feature = "threaded")]
     pub fn block(self) {
         while !self.should_stop() {
             std::thread::sleep(Duration::from_millis(1500));

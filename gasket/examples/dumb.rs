@@ -44,7 +44,7 @@ struct TickerUnit {
     instant: Instant,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Worker<TickerSpec> for Ticker {
     async fn bootstrap(_: &TickerSpec) -> Result<Self, WorkerError> {
         Ok(Self {
@@ -117,7 +117,7 @@ struct Terminal {
     value: Option<Value>,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Worker<TerminalSpec> for Terminal {
     async fn bootstrap(_: &TerminalSpec) -> Result<Self, WorkerError> {
         Ok(Self {
@@ -164,7 +164,8 @@ impl Worker<TerminalSpec> for Terminal {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_max_level(tracing::Level::TRACE)
@@ -232,9 +233,8 @@ fn main() {
     );
 
     let tethers = vec![tether1, tether2, tether3];
-
     let pipeline = gasket::daemon::Daemon::new(tethers);
-    pipeline.block();
+    pipeline.block().await;
 
     // match tether.read_metrics() {
     //     Ok(readings) => {
