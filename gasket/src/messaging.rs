@@ -27,6 +27,10 @@ where
 #[async_trait::async_trait]
 pub trait SendAdapter<P>: Send + Sync {
     async fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
+
+    fn queued_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 pub struct OutputPort<P> {
@@ -42,6 +46,13 @@ impl<P> OutputPort<P> {
         match &mut self.sender {
             Some(sender) => sender.send(msg).await,
             None => Err(Error::NotConnected),
+        }
+    }
+
+    pub fn queued_len(&self) -> Option<usize> {
+        match &self.sender {
+            Some(sender) => sender.queued_len(),
+            None => None,
         }
     }
 }
@@ -266,6 +277,13 @@ pub mod tokio {
             }
 
             Ok(())
+        }
+
+        fn queued_len(&self) -> Option<usize> {
+            match self {
+                ChannelSendAdapter::Mpsc(_) => None,
+                ChannelSendAdapter::Broadcast(x) => Some(x.len()),
+            }
         }
     }
 
