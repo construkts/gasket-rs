@@ -28,7 +28,11 @@ where
 pub trait SendAdapter<P>: Send + Sync {
     async fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
 
-    fn queued_len(&self) -> Option<usize> {
+    fn len(&self) -> Option<usize> {
+        None
+    }
+
+    fn is_empty(&self) -> Option<bool> {
         None
     }
 }
@@ -49,10 +53,17 @@ impl<P> OutputPort<P> {
         }
     }
 
-    pub fn queued_len(&self) -> Option<usize> {
+    pub fn len(&self) -> usize {
         match &self.sender {
-            Some(sender) => sender.queued_len(),
-            None => None,
+            Some(sender) => sender.len().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match &self.sender {
+            Some(sender) => sender.is_empty().unwrap_or(true),
+            None => true,
         }
     }
 }
@@ -95,6 +106,8 @@ where
     P: Send + Sync + Clone,
 {
     async fn recv(&mut self) -> Result<Message<P>, Error>;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
 }
 
 pub struct InputPort<P> {
@@ -122,6 +135,20 @@ where
         let msg = receiver.recv().await?;
 
         Ok(msg)
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.receiver {
+            Some(receiver) => receiver.len(),
+            None => 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match &self.receiver {
+            Some(receiver) => receiver.is_empty(),
+            None => true,
+        }
     }
 }
 
@@ -279,10 +306,17 @@ pub mod tokio {
             Ok(())
         }
 
-        fn queued_len(&self) -> Option<usize> {
+        fn len(&self) -> Option<usize> {
             match self {
                 ChannelSendAdapter::Mpsc(_) => None,
                 ChannelSendAdapter::Broadcast(x) => Some(x.len()),
+            }
+        }
+
+        fn is_empty(&self) -> Option<bool> {
+            match self {
+                ChannelSendAdapter::Mpsc(_) => None,
+                ChannelSendAdapter::Broadcast(x) => Some(x.is_empty()),
             }
         }
     }
@@ -307,6 +341,20 @@ pub mod tokio {
                     Ok(x) => Ok(x),
                     Err(_) => Err(Error::RecvError),
                 },
+            }
+        }
+
+        fn len(&self) -> usize {
+            match self {
+                ChannelRecvAdapter::Mpsc(x) => x.len(),
+                ChannelRecvAdapter::Broadcast(x) => x.len(),
+            }
+        }
+
+        fn is_empty(&self) -> bool {
+            match self {
+                ChannelRecvAdapter::Mpsc(x) => x.is_empty(),
+                ChannelRecvAdapter::Broadcast(x) => x.is_empty(),
             }
         }
     }
