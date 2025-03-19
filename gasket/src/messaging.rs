@@ -53,18 +53,12 @@ impl<P> OutputPort<P> {
         }
     }
 
-    pub fn len(&self) -> usize {
-        match &self.sender {
-            Some(sender) => sender.len().unwrap_or(0),
-            None => 0,
-        }
+    pub fn len(&self) -> Option<usize> {
+        self.sender.as_ref().and_then(|sender| sender.len())
     }
 
-    pub fn is_empty(&self) -> bool {
-        match &self.sender {
-            Some(sender) => sender.is_empty().unwrap_or(true),
-            None => true,
-        }
+    pub fn is_empty(&self) -> Option<bool> {
+        self.sender.as_ref().and_then(|sender| sender.is_empty())
     }
 }
 
