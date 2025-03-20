@@ -1,6 +1,5 @@
 use std::{
     sync::{Arc, Weak},
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -135,7 +134,7 @@ where
 
 impl<S> StageMachine<S>
 where
-    S: Stage,
+    S: Stage + Send + Sync,
 {
     fn new(anchor: Arc<Anchor>, stage: S, policy: Policy, name: String) -> Self {
         StageMachine {
@@ -335,7 +334,6 @@ impl Anchor {
     }
 
     fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
-        println!("cancelling stage");
         self.dismissed.cancel();
 
         Ok(())
@@ -346,8 +344,13 @@ impl Anchor {
 pub struct Tether {
     name: String,
     anchor_ref: Weak<Anchor>,
-    thread_handle: JoinHandle<()>,
     policy: Policy,
+
+    #[cfg(feature = "threaded")]
+    thread_handle: std::thread::JoinHandle<()>,
+
+    #[cfg(not(feature = "threaded"))]
+    thread_handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -362,10 +365,16 @@ impl Tether {
         &self.name
     }
 
+    #[cfg(feature = "threaded")]
     pub fn join_stage(self) {
         self.thread_handle
             .join()
             .expect("called from outside thread");
+    }
+
+    #[cfg(not(feature = "threaded"))]
+    pub async fn join_stage(self) {
+        self.thread_handle.await;
     }
 
     pub fn try_anchor(&self) -> Result<Arc<Anchor>, crate::error::Error> {
@@ -439,18 +448,41 @@ impl Default for Policy {
 }
 
 #[instrument(name="stage", level = Level::INFO, skip_all, fields(stage = machine.name))]
-fn fullfil_stage<S>(mut machine: StageMachine<S>)
+async fn fullfil_stage<S>(mut machine: StageMachine<S>)
 where
     S: Stage,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async { while machine.transition().await != StagePhase::Ended {} });
+    while machine.transition().await != StagePhase::Ended {}
 }
 
+#[cfg(not(feature = "threaded"))]
+pub fn spawn_stage<S: Stage>(stage: S, policy: Policy) -> Tether
+where
+    S: Stage + 'static,
+{
+    let name = stage.name().to_owned();
+
+    let metrics = stage.metrics();
+
+    let anchor = Arc::new(Anchor::new(metrics));
+    let anchor_ref = Arc::downgrade(&anchor);
+
+    let policy2 = policy.clone();
+    let name2 = name.clone();
+
+    let machine = StageMachine::<S>::new(anchor, stage, policy2, name2);
+
+    let thread_handle = tokio::spawn(fullfil_stage(machine));
+
+    Tether {
+        name,
+        anchor_ref,
+        thread_handle,
+        policy,
+    }
+}
+
+#[cfg(feature = "threaded")]
 pub fn spawn_stage<S: Stage>(stage: S, policy: Policy) -> Tether
 where
     S: Stage + 'static,
@@ -466,7 +498,13 @@ where
     let name2 = name.clone();
     let thread_handle = std::thread::spawn(move || {
         let machine = StageMachine::<S>::new(anchor, stage, policy2, name2);
-        fullfil_stage(machine);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(fullfil_stage(machine));
     });
 
     Tether {
@@ -521,7 +559,7 @@ pub mod tests {
         }
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl Worker<MockStage> for MockWorker {
         async fn bootstrap(_: &MockStage) -> Result<Self, WorkerError> {
             Ok(Self {
@@ -688,6 +726,7 @@ pub mod tests {
     //     assert!(elapsed.as_millis() <= 2250);
     // }
 
+    #[cfg(feature = "threaded")]
     #[tokio::test(flavor = "multi_thread")]
     async fn honors_cancel_in_time() {
         let expected_shutdown = Duration::from_millis(1_000);
