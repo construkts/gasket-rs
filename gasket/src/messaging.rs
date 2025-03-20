@@ -27,6 +27,14 @@ where
 #[async_trait::async_trait]
 pub trait SendAdapter<P>: Send + Sync {
     async fn send(&mut self, msg: Message<P>) -> Result<(), Error>;
+
+    fn len(&self) -> Option<usize> {
+        None
+    }
+
+    fn is_empty(&self) -> Option<bool> {
+        None
+    }
 }
 
 pub struct OutputPort<P> {
@@ -43,6 +51,14 @@ impl<P> OutputPort<P> {
             Some(sender) => sender.send(msg).await,
             None => Err(Error::NotConnected),
         }
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        self.sender.as_ref().and_then(|sender| sender.len())
+    }
+
+    pub fn is_empty(&self) -> Option<bool> {
+        self.sender.as_ref().and_then(|sender| sender.is_empty())
     }
 }
 
@@ -84,6 +100,14 @@ where
     P: Send + Sync + Clone,
 {
     async fn recv(&mut self) -> Result<Message<P>, Error>;
+
+    fn len(&self) -> Option<usize> {
+        None
+    }
+
+    fn is_empty(&self) -> Option<bool> {
+        None
+    }
 }
 
 pub struct InputPort<P> {
@@ -111,6 +135,16 @@ where
         let msg = receiver.recv().await?;
 
         Ok(msg)
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        self.receiver.as_ref().and_then(|receiver| receiver.len())
+    }
+
+    pub fn is_empty(&self) -> Option<bool> {
+        self.receiver
+            .as_ref()
+            .and_then(|receiver| receiver.is_empty())
     }
 }
 
@@ -267,6 +301,20 @@ pub mod tokio {
 
             Ok(())
         }
+
+        fn len(&self) -> Option<usize> {
+            match self {
+                ChannelSendAdapter::Mpsc(_) => None,
+                ChannelSendAdapter::Broadcast(x) => Some(x.len()),
+            }
+        }
+
+        fn is_empty(&self) -> Option<bool> {
+            match self {
+                ChannelSendAdapter::Mpsc(_) => None,
+                ChannelSendAdapter::Broadcast(x) => Some(x.is_empty()),
+            }
+        }
     }
 
     pub enum ChannelRecvAdapter<P> {
@@ -289,6 +337,20 @@ pub mod tokio {
                     Ok(x) => Ok(x),
                     Err(_) => Err(Error::RecvError),
                 },
+            }
+        }
+
+        fn len(&self) -> Option<usize> {
+            match self {
+                ChannelRecvAdapter::Mpsc(x) => Some(x.len()),
+                ChannelRecvAdapter::Broadcast(x) => Some(x.len()),
+            }
+        }
+
+        fn is_empty(&self) -> Option<bool> {
+            match self {
+                ChannelRecvAdapter::Mpsc(x) => Some(x.is_empty()),
+                ChannelRecvAdapter::Broadcast(x) => Some(x.is_empty()),
             }
         }
     }
