@@ -83,7 +83,7 @@ fn matches_type(type_path: &syn::TypePath, target_type: &str) -> bool {
         .path
         .segments
         .last()
-        .map_or(false, |segment| segment.ident == target_type)
+        .is_some_and(|segment| segment.ident == target_type)
 }
 
 fn expand_metric_registration(struct_: &DataStruct) -> syn::Result<Vec<TokenStream>> {
@@ -121,7 +121,7 @@ fn expand_metric_registration(struct_: &DataStruct) -> syn::Result<Vec<TokenStre
 fn expand_stage_impl(input: DeriveInput) -> TokenStream {
     let struct_ = match expect_struct(&input) {
         Ok(x) => x,
-        Err(err) => return TokenStream::from(err.to_compile_error()),
+        Err(err) => return err.to_compile_error(),
     };
 
     let metrics_code = match expand_metric_registration(struct_) {

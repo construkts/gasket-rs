@@ -451,7 +451,7 @@ where
     rt.block_on(async { while machine.transition().await != StagePhase::Ended {} });
 }
 
-pub fn spawn_stage<S: Stage>(stage: S, policy: Policy) -> Tether
+pub fn spawn_stage<S>(stage: S, policy: Policy) -> Tether
 where
     S: Stage + 'static,
 {
