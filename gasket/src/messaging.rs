@@ -77,6 +77,7 @@ impl<P> Fanout<P>
 where
     P: Clone,
 {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(&mut self, mut ports: Vec<OutputPort<P>>) {
         self.senders.append(&mut ports);
     }
@@ -197,14 +198,14 @@ impl TimerPort {
 
     pub async fn recv(&mut self) -> Result<std::time::Instant, Error> {
         if self.running.is_none() {
-            let running = RunningTimer::start(self.interval.clone());
+            let running = RunningTimer::start(self.interval);
             self.running = Some(running);
         }
 
         let running = self.running.as_mut().ok_or(Error::NotConnected)?;
 
         running.recv.changed().await.map_err(|_| Error::RecvError)?;
-        Ok(running.recv.borrow().clone())
+        Ok(*running.recv.borrow())
     }
 }
 
