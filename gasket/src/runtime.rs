@@ -335,7 +335,6 @@ impl Anchor {
     }
 
     fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
-        println!("cancelling stage");
         self.dismissed.cancel();
 
         Ok(())
