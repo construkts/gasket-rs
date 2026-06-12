@@ -320,7 +320,7 @@ where
 pub struct Anchor {
     metrics: metrics::Registry,
     dismissed: tokio_util::sync::CancellationToken,
-    last_state: AtomicCell<StagePhase>,
+    last_state: Arc<AtomicCell<StagePhase>>,
     last_tick: AtomicCell<Instant>,
 }
 
@@ -330,12 +330,12 @@ impl Anchor {
             metrics,
             dismissed: tokio_util::sync::CancellationToken::new(),
             last_tick: AtomicCell::new(Instant::now()),
-            last_state: AtomicCell::new(StagePhase::Bootstrap),
+            last_state: Arc::new(AtomicCell::new(StagePhase::Bootstrap)),
         }
     }
 
     fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
-        println!("cancelling stage");
+        trace!("dismissing stage");
         self.dismissed.cancel();
 
         Ok(())
@@ -346,6 +346,8 @@ impl Anchor {
 pub struct Tether {
     name: String,
     anchor_ref: Weak<Anchor>,
+    // strong handle that outlives the stage thread, unlike `anchor_ref`.
+    last_state: Arc<AtomicCell<StagePhase>>,
     thread_handle: JoinHandle<()>,
     policy: Policy,
 }
@@ -355,6 +357,9 @@ pub enum TetherState {
     Dropped,
     Blocked(StagePhase),
     Alive(StagePhase),
+    /// The stage thread has ended; carries the last phase it reached, so a
+    /// graceful `Ended` can be told apart from a stage that died mid-work.
+    Finished(StagePhase),
 }
 
 impl Tether {
@@ -381,26 +386,23 @@ impl Tether {
     }
 
     pub fn check_state(&self) -> TetherState {
-        let anchor = self.try_anchor();
+        let last_phase = self.last_state.load();
 
-        if anchor.is_err() {
-            return TetherState::Dropped;
-        }
-
-        let anchor = anchor.unwrap();
-        let last_phase = anchor.last_state.load();
+        let anchor = match self.try_anchor() {
+            Ok(anchor) => anchor,
+            // anchor gone => the stage thread has ended at `last_phase`.
+            Err(_) => return TetherState::Finished(last_phase),
+        };
 
         if let Some(timeout) = &self.policy.tick_timeout {
             let last_tick = anchor.last_tick.load();
 
             if last_tick.elapsed() > *timeout {
-                TetherState::Blocked(last_phase)
-            } else {
-                TetherState::Alive(last_phase)
+                return TetherState::Blocked(last_phase);
             }
-        } else {
-            TetherState::Alive(last_phase)
         }
+
+        TetherState::Alive(last_phase)
     }
 
     pub fn wait_state(&self, expected: TetherState) {
@@ -461,6 +463,7 @@ where
 
     let anchor = Arc::new(Anchor::new(metrics));
     let anchor_ref = Arc::downgrade(&anchor);
+    let last_state = Arc::clone(&anchor.last_state);
 
     let policy2 = policy.clone();
     let name2 = name.clone();
@@ -472,6 +475,7 @@ where
     Tether {
         name,
         anchor_ref,
+        last_state,
         thread_handle,
         policy,
     }
@@ -716,5 +720,32 @@ pub mod tests {
             expected_shutdown.as_secs_f64(),
             epsilon = 0.01
         );
+    }
+
+    #[test]
+    fn check_state_reports_finished_with_terminal_phase() {
+        let stage = MockStage {
+            schedule_delay: Some(Duration::from_millis(20)),
+            ..Default::default()
+        };
+
+        let tether = super::spawn_stage(stage, Policy::default());
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(matches!(tether.check_state(), TetherState::Alive(_)));
+
+        tether.dismiss_stage().unwrap();
+
+        let mut state = tether.check_state();
+        for _ in 0..200 {
+            state = tether.check_state();
+            if matches!(state, TetherState::Finished(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // a graceful stop is retained as Finished(Ended), not collapsed to Dropped
+        assert_eq!(state, TetherState::Finished(StagePhase::Ended));
     }
 }
