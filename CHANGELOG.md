@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-06-12
+
+### 🚀 Features
+
+- Expose port / adapter len values (#31)
+- Retain terminal phase in a Finished tether state (#35)
+
+### 🐛 Bug Fixes
+
+- Use correct metric type when exporting gauges (#30)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update cargo release config
+
 ## [0.9.0] - 2025-01-15
 
 ### 🚀 Features
@@ -17,6 +32,7 @@ All notable changes to this project will be documented in this file.
 
 - Automate changelog generation (#28)
 - Configure release procedure (#29)
+- Release
 
 ## [0.8.0] - 2024-05-18
 
