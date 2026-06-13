@@ -79,7 +79,7 @@ impl Daemon {
     pub fn has_ended(&self) -> bool {
         self.0.iter().any(|tether| match tether.check_state() {
             TetherState::Alive(p) => {
-                matches!(p, StagePhase::Ended)
+                matches!(p, StagePhase::Ended(_))
             }
             _ => true,
         })
@@ -90,9 +90,8 @@ impl Daemon {
     /// A worker that finished its work means graceful finalization, which
     /// takes precedence over other stages erroring out as a cascading side
     /// effect (eg: a port closing because its counterpart stage already
-    /// ended). All terminal paths in the stage machine go through the `Ended`
-    /// phase, so the classification relies on each tether's `EndCause` rather
-    /// than on its phase.
+    /// ended). The terminal `Ended` phase carries the `EndCause` it ended
+    /// with, so the classification reads straight off each tether's phase.
     pub fn stop_reason(&self) -> Option<StopReason> {
         if self.is_terminated() {
             return Some(StopReason::Terminated);
@@ -103,33 +102,31 @@ impl Daemon {
         let mut dismissed = None;
 
         for tether in self.tethers() {
-            match tether.end_cause() {
-                Some(EndCause::Done) => return Some(StopReason::Finalized),
-                Some(EndCause::Errored) => {
-                    crashed.get_or_insert_with(|| StopReason::Crashed {
-                        stage: tether.name().to_owned(),
-                    });
+            let stage = || tether.name().to_owned();
+
+            match tether.check_state() {
+                // a stage that finalized gracefully wins outright
+                TetherState::Alive(StagePhase::Ended(EndCause::Done))
+                | TetherState::Finished(StagePhase::Ended(EndCause::Done)) => {
+                    return Some(StopReason::Finalized);
                 }
-                Some(EndCause::Dismissed) => {
-                    dismissed.get_or_insert_with(|| StopReason::Dismissed {
-                        stage: tether.name().to_owned(),
-                    });
+                TetherState::Alive(StagePhase::Ended(EndCause::Errored))
+                | TetherState::Finished(StagePhase::Ended(EndCause::Errored)) => {
+                    crashed.get_or_insert_with(|| StopReason::Crashed { stage: stage() });
                 }
-                None => match tether.check_state() {
-                    // the stage thread died without recording a cause, which
-                    // means it panicked mid-work
-                    TetherState::Dropped | TetherState::Finished(_) => {
-                        crashed.get_or_insert_with(|| StopReason::Crashed {
-                            stage: tether.name().to_owned(),
-                        });
-                    }
-                    TetherState::Blocked(_) => {
-                        blocked.get_or_insert_with(|| StopReason::Blocked {
-                            stage: tether.name().to_owned(),
-                        });
-                    }
-                    TetherState::Alive(_) => (),
-                },
+                TetherState::Alive(StagePhase::Ended(EndCause::Dismissed))
+                | TetherState::Finished(StagePhase::Ended(EndCause::Dismissed)) => {
+                    dismissed.get_or_insert_with(|| StopReason::Dismissed { stage: stage() });
+                }
+                // the thread is gone but never reached `Ended`, so it panicked
+                // mid-work
+                TetherState::Dropped | TetherState::Finished(_) => {
+                    crashed.get_or_insert_with(|| StopReason::Crashed { stage: stage() });
+                }
+                TetherState::Blocked(_) => {
+                    blocked.get_or_insert_with(|| StopReason::Blocked { stage: stage() });
+                }
+                TetherState::Alive(_) => (),
             }
         }
 
