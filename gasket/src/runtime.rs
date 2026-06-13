@@ -16,12 +16,38 @@ use crate::{
 
 use crate::framework::*;
 
+/// Why a stage reached its terminal `Ended` state.
+///
+/// Every terminal transition in the state machine carries one of these, so the
+/// phase that ends a stage records *why* it ended rather than collapsing every
+/// path into an indistinguishable `Ended`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EndCause {
+    /// the worker reported that all of its work is done
+    Done,
+    /// the stage was dismissed from the outside
+    Dismissed,
+    /// a worker error (panic, exhausted retries or messaging failure)
+    /// terminated the stage
+    Errored,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum StagePhase {
     Bootstrap,
     Working,
     Teardown,
-    Ended,
+    Ended(EndCause),
+}
+
+impl StagePhase {
+    /// The cause the stage ended with, if this is the terminal phase.
+    pub fn end_cause(&self) -> Option<EndCause> {
+        match self {
+            StagePhase::Ended(cause) => Some(*cause),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -32,8 +58,11 @@ where
     Bootstrap(Retry),
     Scheduling(S::Worker, Retry),
     Executing(S::Worker, S::Unit, Retry),
-    Teardown(S::Worker, Retry, Ended),
-    Ended,
+    /// The `Option<EndCause>` is the pending outcome: `Some(cause)` means the
+    /// stage will end with that cause once teardown completes, `None` means it
+    /// will restart (`WorkerError::Restart`).
+    Teardown(S::Worker, Retry, Option<EndCause>),
+    Ended(EndCause),
 }
 
 impl<S> StageState<S>
@@ -47,7 +76,7 @@ where
             StageState::Scheduling(x, ..) => Some(x),
             StageState::Executing(x, ..) => Some(x),
             StageState::Teardown(x, ..) => Some(x),
-            StageState::Ended => None,
+            StageState::Ended(_) => None,
         }
     }
 }
@@ -62,12 +91,10 @@ where
             StageState::Scheduling(..) => Self::Working,
             StageState::Executing(..) => Self::Working,
             StageState::Teardown(..) => Self::Teardown,
-            StageState::Ended => Self::Ended,
+            StageState::Ended(cause) => Self::Ended(*cause),
         }
     }
 }
-
-type Ended = bool;
 
 #[derive(Debug)]
 pub enum StageEvent<S>
@@ -84,8 +111,8 @@ where
     ExecuteError(S::Worker, S::Unit, WorkerError, Retry),
     BootstrapOk(S::Worker),
     BootstrapError(WorkerError, Retry),
-    TeardownOk(Ended),
-    TeardownError(S::Worker, WorkerError, Retry, Ended),
+    TeardownOk(Option<EndCause>),
+    TeardownError(S::Worker, WorkerError, Retry, Option<EndCause>),
 }
 
 struct StageMachine<S>
@@ -156,7 +183,8 @@ where
 
         tokio::select! {
             _ = self.anchor.dismissed.cancelled() => {
-                StageEvent::TeardownOk(true)
+                // there's no worker yet, so end straight away as dismissed
+                StageEvent::TeardownOk(Some(EndCause::Dismissed))
             }
             bootstrap = S::Worker::bootstrap(&self.stage) => {
                 match bootstrap {
@@ -219,7 +247,7 @@ where
         &mut self,
         mut worker: S::Worker,
         retry: Retry,
-        ended: Ended,
+        ended: Option<EndCause>,
     ) -> StageEvent<S> {
         retry
             .wait_backoff(&self.policy.teardown_retry, self.anchor.dismissed.clone())
@@ -237,7 +265,7 @@ where
             StageState::Scheduling(worker, retry) => self.schedule(worker, retry).await,
             StageState::Executing(worker, unit, retry) => self.execute(worker, unit, retry).await,
             StageState::Teardown(worker, retry, ended) => self.teardown(worker, retry, ended).await,
-            StageState::Ended => unreachable!("ended stage shouldn't actuate"),
+            StageState::Ended(_) => unreachable!("ended stage shouldn't actuate"),
         }
     }
 
@@ -246,44 +274,52 @@ where
             StageEvent::BootstrapOk(w) => StageState::Scheduling(w, Retry::fresh()),
             StageEvent::BootstrapError(err, retry) => match err {
                 WorkerError::Retry if retry.maxed(&self.policy.bootstrap_retry) => {
-                    StageState::Ended
+                    StageState::Ended(EndCause::Errored)
                 }
                 WorkerError::Retry => StageState::Bootstrap(retry.next()),
-                _ => StageState::Ended,
+                _ => StageState::Ended(EndCause::Errored),
             },
             StageEvent::NextUnit(w, u) => StageState::Executing(w, u, Retry::fresh()),
             StageEvent::WorkerIdle(w) => StageState::Scheduling(w, Retry::fresh()),
             StageEvent::ScheduleError(w, err, retry) => match err {
-                WorkerError::Restart => StageState::Teardown(w, Retry::fresh(), false),
+                WorkerError::Restart => StageState::Teardown(w, Retry::fresh(), None),
                 WorkerError::Retry if !retry.maxed(&self.policy.work_retry) => {
                     StageState::Scheduling(w, retry.next())
                 }
                 WorkerError::Retry if retry.dismissed(&self.policy.work_retry) => {
                     StageState::Scheduling(w, Retry::fresh())
                 }
-                _ => StageState::Teardown(w, Retry::fresh(), true),
+                _ => StageState::Teardown(w, Retry::fresh(), Some(EndCause::Errored)),
             },
             StageEvent::ExecuteOk(w) => StageState::Scheduling(w, Retry::fresh()),
             StageEvent::ExecuteError(w, u, err, retry) => match err {
-                WorkerError::Restart => StageState::Teardown(w, Retry::fresh(), false),
+                WorkerError::Restart => StageState::Teardown(w, Retry::fresh(), None),
                 WorkerError::Retry if !retry.maxed(&self.policy.work_retry) => {
                     StageState::Executing(w, u, retry.next())
                 }
                 WorkerError::Retry if retry.dismissed(&self.policy.work_retry) => {
                     StageState::Scheduling(w, Retry::fresh())
                 }
-                _ => StageState::Teardown(w, Retry::fresh(), true),
+                _ => StageState::Teardown(w, Retry::fresh(), Some(EndCause::Errored)),
             },
-            StageEvent::WorkerDone(w) => StageState::Teardown(w, Retry::fresh(), true),
-            StageEvent::MessagingError(w) => StageState::Teardown(w, Retry::fresh(), true),
-            StageEvent::Dismissed(w) => StageState::Teardown(w, Retry::fresh(), true),
-            StageEvent::TeardownOk(false) => StageState::Bootstrap(Retry::fresh()),
-            StageEvent::TeardownOk(true) => StageState::Ended,
+            StageEvent::WorkerDone(w) => {
+                StageState::Teardown(w, Retry::fresh(), Some(EndCause::Done))
+            }
+            StageEvent::MessagingError(w) => {
+                StageState::Teardown(w, Retry::fresh(), Some(EndCause::Errored))
+            }
+            StageEvent::Dismissed(w) => {
+                StageState::Teardown(w, Retry::fresh(), Some(EndCause::Dismissed))
+            }
+            StageEvent::TeardownOk(None) => StageState::Bootstrap(Retry::fresh()),
+            StageEvent::TeardownOk(Some(cause)) => StageState::Ended(cause),
             StageEvent::TeardownError(w, err, retry, ended) => match err {
                 WorkerError::Retry if !retry.maxed(&self.policy.teardown_retry) => {
                     StageState::Teardown(w, retry.next(), ended)
                 }
-                _ => StageState::Ended,
+                // a teardown that gives up ends the stage; the original cause
+                // wins, falling back to `Errored` for a failed restart
+                _ => StageState::Ended(ended.unwrap_or(EndCause::Errored)),
             },
         }
     }
@@ -292,9 +328,9 @@ where
         let prev_state = self.state.take().unwrap();
         let prev_phase = StagePhase::from(&prev_state);
 
-        if prev_phase == StagePhase::Ended {
+        if matches!(prev_phase, StagePhase::Ended(_)) {
             self.state = Some(prev_state);
-            return StagePhase::Ended;
+            return prev_phase;
         }
 
         let event = self.actuate(prev_state).await;
@@ -362,6 +398,33 @@ pub enum TetherState {
     Finished(StagePhase),
 }
 
+impl TetherState {
+    /// The cause the stage ended with, if it reached its terminal phase —
+    /// whether the thread is still winding down (`Alive`) or already gone
+    /// (`Finished`).
+    pub fn end_cause(&self) -> Option<EndCause> {
+        match self {
+            TetherState::Alive(phase) | TetherState::Finished(phase) => phase.end_cause(),
+            _ => None,
+        }
+    }
+
+    /// The stage thread is gone but never reached `Ended`, i.e. it panicked
+    /// mid-work.
+    pub fn has_panicked(&self) -> bool {
+        match self {
+            TetherState::Dropped => true,
+            TetherState::Finished(phase) => phase.end_cause().is_none(),
+            _ => false,
+        }
+    }
+
+    /// The stage stopped ticking within its timeout.
+    pub fn is_stalled(&self) -> bool {
+        matches!(self, TetherState::Blocked(_))
+    }
+}
+
 impl Tether {
     pub fn name(&self) -> &str {
         &self.name
@@ -383,6 +446,12 @@ impl Tether {
     pub fn dismiss_stage(&self) -> Result<(), crate::error::Error> {
         let anchor = self.try_anchor()?;
         anchor.dismiss_stage()
+    }
+
+    /// Why the stage ended, if it has reached its terminal state. Derived from
+    /// the last phase, so it remains readable after the stage thread is gone.
+    pub fn end_cause(&self) -> Option<EndCause> {
+        self.last_state.load().end_cause()
     }
 
     pub fn check_state(&self) -> TetherState {
@@ -450,7 +519,7 @@ where
         .build()
         .unwrap();
 
-    rt.block_on(async { while machine.transition().await != StagePhase::Ended {} });
+    rt.block_on(async { while !matches!(machine.transition().await, StagePhase::Ended(_)) {} });
 }
 
 pub fn spawn_stage<S: Stage>(stage: S, policy: Policy) -> Tether
@@ -489,9 +558,10 @@ pub mod tests {
 
     #[derive(Clone, Default)]
     pub struct MockStage {
-        failures: Vec<bool>,
-        schedule_delay: Option<Duration>,
-        execute_delay: Option<Duration>,
+        pub failures: Vec<bool>,
+        pub schedule_delay: Option<Duration>,
+        pub execute_delay: Option<Duration>,
+        pub done_after: Option<usize>,
     }
 
     impl Stage for MockStage {
@@ -546,6 +616,13 @@ pub mod tests {
                 tokio::time::sleep(delay).await;
             }
 
+            if stage
+                .done_after
+                .is_some_and(|max| self.schedule_count > max)
+            {
+                return Ok(WorkSchedule::Done);
+            }
+
             Ok(WorkSchedule::Unit(self.schedule_count))
         }
 
@@ -578,7 +655,7 @@ pub mod tests {
 
         machine.transition().await;
 
-        assert!(matches!(machine.state, Some(StageState::Ended)));
+        assert!(matches!(machine.state, Some(StageState::Ended(_))));
     }
 
     async fn should_bootstrap(machine: &mut StageMachine<MockStage>) {
@@ -746,6 +823,9 @@ pub mod tests {
         }
 
         // a graceful stop is retained as Finished(Ended), not collapsed to Dropped
-        assert_eq!(state, TetherState::Finished(StagePhase::Ended));
+        assert_eq!(
+            state,
+            TetherState::Finished(StagePhase::Ended(EndCause::Dismissed))
+        );
     }
 }
