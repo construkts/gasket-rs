@@ -63,6 +63,19 @@ impl StopReason {
             self
         }
     }
+
+    /// The reason a stage that reached its terminal phase stopped the daemon.
+    fn from_end_cause(cause: EndCause, stage: &str) -> Self {
+        match cause {
+            EndCause::Done => StopReason::Finalized,
+            EndCause::Errored => StopReason::Crashed {
+                stage: stage.to_owned(),
+            },
+            EndCause::Dismissed => StopReason::Dismissed {
+                stage: stage.to_owned(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for StopReason {
@@ -124,33 +137,24 @@ impl Daemon {
             .reduce(StopReason::or_stronger)
     }
 
-    /// How a single stage contributes to the stop decision, if at all. The
-    /// terminal `Ended` phase carries the `EndCause` it ended with, so the
-    /// reason reads straight off the tether's phase.
+    /// How a single stage contributes to the stop decision, if at all.
     fn tether_stop_reason(tether: &Tether) -> Option<StopReason> {
-        let stage = || tether.name().to_owned();
+        let state = tether.check_state();
+        let stage = tether.name();
 
-        match tether.check_state() {
-            // the stage reached its terminal phase; the cause it ended with
-            // names the reason
-            TetherState::Alive(StagePhase::Ended(cause))
-            | TetherState::Finished(StagePhase::Ended(cause)) => Some(match cause {
-                EndCause::Done => StopReason::Finalized,
-                EndCause::Errored => StopReason::Crashed { stage: stage() },
-                EndCause::Dismissed => StopReason::Dismissed { stage: stage() },
-            }),
-
-            // the thread is gone but never reached `Ended`, so it panicked
-            // mid-work
-            TetherState::Dropped | TetherState::Finished(_) => {
-                Some(StopReason::Crashed { stage: stage() })
-            }
-
-            // the stage stopped ticking within its timeout
-            TetherState::Blocked(_) => Some(StopReason::Blocked { stage: stage() }),
-
+        if let Some(cause) = state.end_cause() {
+            Some(StopReason::from_end_cause(cause, stage))
+        } else if state.has_panicked() {
+            Some(StopReason::Crashed {
+                stage: stage.to_owned(),
+            })
+        } else if state.is_stalled() {
+            Some(StopReason::Blocked {
+                stage: stage.to_owned(),
+            })
+        } else {
             // still working
-            TetherState::Alive(_) => None,
+            None
         }
     }
 

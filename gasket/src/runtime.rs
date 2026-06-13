@@ -40,6 +40,16 @@ pub enum StagePhase {
     Ended(EndCause),
 }
 
+impl StagePhase {
+    /// The cause the stage ended with, if this is the terminal phase.
+    pub fn end_cause(&self) -> Option<EndCause> {
+        match self {
+            StagePhase::Ended(cause) => Some(*cause),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum StageState<S>
 where
@@ -388,6 +398,33 @@ pub enum TetherState {
     Finished(StagePhase),
 }
 
+impl TetherState {
+    /// The cause the stage ended with, if it reached its terminal phase —
+    /// whether the thread is still winding down (`Alive`) or already gone
+    /// (`Finished`).
+    pub fn end_cause(&self) -> Option<EndCause> {
+        match self {
+            TetherState::Alive(phase) | TetherState::Finished(phase) => phase.end_cause(),
+            _ => None,
+        }
+    }
+
+    /// The stage thread is gone but never reached `Ended`, i.e. it panicked
+    /// mid-work.
+    pub fn has_panicked(&self) -> bool {
+        match self {
+            TetherState::Dropped => true,
+            TetherState::Finished(phase) => phase.end_cause().is_none(),
+            _ => false,
+        }
+    }
+
+    /// The stage stopped ticking within its timeout.
+    pub fn is_stalled(&self) -> bool {
+        matches!(self, TetherState::Blocked(_))
+    }
+}
+
 impl Tether {
     pub fn name(&self) -> &str {
         &self.name
@@ -414,10 +451,7 @@ impl Tether {
     /// Why the stage ended, if it has reached its terminal state. Derived from
     /// the last phase, so it remains readable after the stage thread is gone.
     pub fn end_cause(&self) -> Option<EndCause> {
-        match self.last_state.load() {
-            StagePhase::Ended(cause) => Some(cause),
-            _ => None,
-        }
+        self.last_state.load().end_cause()
     }
 
     pub fn check_state(&self) -> TetherState {
