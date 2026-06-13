@@ -39,6 +39,30 @@ impl StopReason {
             StopReason::Terminated | StopReason::Finalized | StopReason::Dismissed { .. }
         )
     }
+
+    /// Which reason best explains the stop when several stages report one at
+    /// the same instant. A graceful finalization outranks a crash (a finished
+    /// producer routinely makes its consumers error as a cascade), a crash
+    /// outranks a stall, and a stall outranks an external dismissal.
+    fn precedence(&self) -> u8 {
+        match self {
+            StopReason::Terminated => 5,
+            StopReason::Finalized => 4,
+            StopReason::Crashed { .. } => 3,
+            StopReason::Blocked { .. } => 2,
+            StopReason::Dismissed { .. } => 1,
+        }
+    }
+
+    /// Keep whichever of two reasons better explains the stop, favouring the
+    /// earlier stage on a tie so the first offender is the one reported.
+    fn or_stronger(self, other: Self) -> Self {
+        if other.precedence() > self.precedence() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 impl fmt::Display for StopReason {
@@ -87,50 +111,47 @@ impl Daemon {
 
     /// Why the daemon should stop, if it should at all.
     ///
-    /// A worker that finished its work means graceful finalization, which
-    /// takes precedence over other stages erroring out as a cascading side
-    /// effect (eg: a port closing because its counterpart stage already
-    /// ended). The terminal `Ended` phase carries the `EndCause` it ended
-    /// with, so the classification reads straight off each tether's phase.
+    /// Each running stage either contributes a reason or none; the daemon
+    /// reports the one that best explains the stop (see
+    /// [`StopReason::precedence`]).
     pub fn stop_reason(&self) -> Option<StopReason> {
         if self.is_terminated() {
             return Some(StopReason::Terminated);
         }
 
-        let mut crashed = None;
-        let mut blocked = None;
-        let mut dismissed = None;
+        self.tethers()
+            .filter_map(Self::tether_stop_reason)
+            .reduce(StopReason::or_stronger)
+    }
 
-        for tether in self.tethers() {
-            let stage = || tether.name().to_owned();
+    /// How a single stage contributes to the stop decision, if at all. The
+    /// terminal `Ended` phase carries the `EndCause` it ended with, so the
+    /// reason reads straight off the tether's phase.
+    fn tether_stop_reason(tether: &Tether) -> Option<StopReason> {
+        let stage = || tether.name().to_owned();
 
-            match tether.check_state() {
-                // a stage that finalized gracefully wins outright
-                TetherState::Alive(StagePhase::Ended(EndCause::Done))
-                | TetherState::Finished(StagePhase::Ended(EndCause::Done)) => {
-                    return Some(StopReason::Finalized);
-                }
-                TetherState::Alive(StagePhase::Ended(EndCause::Errored))
-                | TetherState::Finished(StagePhase::Ended(EndCause::Errored)) => {
-                    crashed.get_or_insert_with(|| StopReason::Crashed { stage: stage() });
-                }
-                TetherState::Alive(StagePhase::Ended(EndCause::Dismissed))
-                | TetherState::Finished(StagePhase::Ended(EndCause::Dismissed)) => {
-                    dismissed.get_or_insert_with(|| StopReason::Dismissed { stage: stage() });
-                }
-                // the thread is gone but never reached `Ended`, so it panicked
-                // mid-work
-                TetherState::Dropped | TetherState::Finished(_) => {
-                    crashed.get_or_insert_with(|| StopReason::Crashed { stage: stage() });
-                }
-                TetherState::Blocked(_) => {
-                    blocked.get_or_insert_with(|| StopReason::Blocked { stage: stage() });
-                }
-                TetherState::Alive(_) => (),
+        match tether.check_state() {
+            // the stage reached its terminal phase; the cause it ended with
+            // names the reason
+            TetherState::Alive(StagePhase::Ended(cause))
+            | TetherState::Finished(StagePhase::Ended(cause)) => Some(match cause {
+                EndCause::Done => StopReason::Finalized,
+                EndCause::Errored => StopReason::Crashed { stage: stage() },
+                EndCause::Dismissed => StopReason::Dismissed { stage: stage() },
+            }),
+
+            // the thread is gone but never reached `Ended`, so it panicked
+            // mid-work
+            TetherState::Dropped | TetherState::Finished(_) => {
+                Some(StopReason::Crashed { stage: stage() })
             }
-        }
 
-        crashed.or(blocked).or(dismissed)
+            // the stage stopped ticking within its timeout
+            TetherState::Blocked(_) => Some(StopReason::Blocked { stage: stage() }),
+
+            // still working
+            TetherState::Alive(_) => None,
+        }
     }
 
     pub fn should_stop(&self) -> bool {
