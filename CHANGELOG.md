@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-06-13
+
+### 🚀 Features
+
+- Derive a StopReason from each stage's terminal cause (#36)
+
+### ⚙️ Miscellaneous Tasks
+
+- Improve release commit message
+
 ## [0.10.0] - 2026-06-12
 
 ### 🚀 Features
@@ -16,6 +26,7 @@ All notable changes to this project will be documented in this file.
 ### ⚙️ Miscellaneous Tasks
 
 - Update cargo release config
+- Release
 
 ## [0.9.0] - 2025-01-15
 
