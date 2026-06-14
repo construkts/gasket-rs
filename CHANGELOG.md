@@ -2,11 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.1] - 2026-06-14
+
+### 🚀 Features
+
+- Drop prometheus_exporter_base for a lightweight metrics endpoint (#37) (#38)
+
 ## [0.11.0] - 2026-06-13
 
 ### 🚀 Features
 
 - Derive a StopReason from each stage's terminal cause (#36)
+
+### 💼 Other
+
+- V0.11.0
 
 ### ⚙️ Miscellaneous Tasks
 
