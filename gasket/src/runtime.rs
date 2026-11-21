@@ -946,10 +946,11 @@ pub mod tests {
             ..Default::default()
         };
 
+        // the stage idles after one unit, so busy time can only reach the
+        // delay through that unit; waiting on busy time itself avoids reading
+        // a snapshot taken between the unit and busy-time increments
         let tether = super::spawn_stage(stage, Policy::default());
-        let readings = wait_reading(&tether, "gasket_units", 1);
-
-        assert!(read(&readings, "gasket_busy_micros") >= delay.as_micros() as i128);
+        wait_reading(&tether, "gasket_busy_micros", delay.as_micros() as i128);
 
         tether.dismiss_stage().unwrap();
         tether.join_stage();
