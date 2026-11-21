@@ -950,7 +950,16 @@ pub mod tests {
         // delay through that unit; waiting on busy time itself avoids reading
         // a snapshot taken between the unit and busy-time increments
         let tether = super::spawn_stage(stage, Policy::default());
-        wait_reading(&tether, "gasket_busy_micros", delay.as_micros() as i128);
+        let readings = wait_reading(&tether, "gasket_busy_micros", delay.as_micros() as i128);
+
+        // idling adds no busy time, so the reading stays put
+        std::thread::sleep(Duration::from_millis(50));
+        let readings_later = tether.read_metrics().unwrap();
+        assert_eq!(read(&readings_later, "gasket_units"), 1);
+        assert_eq!(
+            read(&readings_later, "gasket_busy_micros"),
+            read(&readings, "gasket_busy_micros")
+        );
 
         tether.dismiss_stage().unwrap();
         tether.join_stage();
