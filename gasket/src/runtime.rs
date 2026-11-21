@@ -124,7 +124,38 @@ where
     anchor: Arc<Anchor>,
     policy: Policy,
     name: String,
-    tick_count: metrics::Counter,
+}
+
+/// The entries the runtime keeps for every stage, beside the stage's own; see
+/// the [`metrics`](crate::metrics) module docs for their semantics.
+#[derive(Default)]
+struct FrameworkMetrics {
+    ticks: metrics::Counter,
+    units: metrics::Counter,
+    busy_micros: metrics::Counter,
+    retries: metrics::Counter,
+    phase: metrics::Gauge,
+}
+
+impl FrameworkMetrics {
+    fn register(&self, registry: &mut metrics::Registry) {
+        use metrics::Metric::{Counter, Gauge};
+
+        registry.insert("gasket_ticks", Counter(self.ticks.clone()));
+        registry.insert("gasket_units", Counter(self.units.clone()));
+        registry.insert("gasket_busy_micros", Counter(self.busy_micros.clone()));
+        registry.insert("gasket_retries", Counter(self.retries.clone()));
+        registry.insert("gasket_phase", Gauge(self.phase.clone()));
+    }
+}
+
+fn phase_code(phase: StagePhase) -> i64 {
+    match phase {
+        StagePhase::Bootstrap => 0,
+        StagePhase::Working => 1,
+        StagePhase::Teardown => 2,
+        StagePhase::Ended(_) => 3,
+    }
 }
 
 #[inline]
@@ -168,7 +199,6 @@ where
         StageMachine {
             stage,
             state: Some(StageState::Bootstrap(Retry::fresh())),
-            tick_count: Default::default(),
             name,
             anchor,
             policy,
@@ -229,17 +259,28 @@ where
             .wait_backoff(&self.policy.teardown_retry, self.anchor.dismissed.clone())
             .await;
 
-        tokio::select! {
+        let framework = &self.anchor.framework;
+        let started = Instant::now();
+
+        let event = tokio::select! {
             _ = self.anchor.dismissed.cancelled() => {
-                return StageEvent::Dismissed(worker);
+                StageEvent::Dismissed(worker)
             }
             execute = worker.execute(&unit, &mut self.stage) => {
+                framework.units.inc(1);
+
                 match execute {
                     Ok(_) => StageEvent::ExecuteOk(worker),
                     Err(err) => StageEvent::ExecuteError(worker, unit, err, retry),
                 }
             }
-        }
+        };
+
+        framework
+            .busy_micros
+            .inc(started.elapsed().as_micros() as u64);
+
+        event
     }
 
     #[instrument(level = Level::INFO, skip_all)]
@@ -269,6 +310,11 @@ where
         }
     }
 
+    fn next_retry(&self, retry: Retry) -> Retry {
+        self.anchor.framework.retries.inc(1);
+        retry.next()
+    }
+
     fn apply(&self, event: StageEvent<S>) -> StageState<S> {
         match event {
             StageEvent::BootstrapOk(w) => StageState::Scheduling(w, Retry::fresh()),
@@ -276,7 +322,7 @@ where
                 WorkerError::Retry if retry.maxed(&self.policy.bootstrap_retry) => {
                     StageState::Ended(EndCause::Errored)
                 }
-                WorkerError::Retry => StageState::Bootstrap(retry.next()),
+                WorkerError::Retry => StageState::Bootstrap(self.next_retry(retry)),
                 _ => StageState::Ended(EndCause::Errored),
             },
             StageEvent::NextUnit(w, u) => StageState::Executing(w, u, Retry::fresh()),
@@ -284,7 +330,7 @@ where
             StageEvent::ScheduleError(w, err, retry) => match err {
                 WorkerError::Restart => StageState::Teardown(w, Retry::fresh(), None),
                 WorkerError::Retry if !retry.maxed(&self.policy.work_retry) => {
-                    StageState::Scheduling(w, retry.next())
+                    StageState::Scheduling(w, self.next_retry(retry))
                 }
                 WorkerError::Retry if retry.dismissed(&self.policy.work_retry) => {
                     StageState::Scheduling(w, Retry::fresh())
@@ -295,7 +341,7 @@ where
             StageEvent::ExecuteError(w, u, err, retry) => match err {
                 WorkerError::Restart => StageState::Teardown(w, Retry::fresh(), None),
                 WorkerError::Retry if !retry.maxed(&self.policy.work_retry) => {
-                    StageState::Executing(w, u, retry.next())
+                    StageState::Executing(w, u, self.next_retry(retry))
                 }
                 WorkerError::Retry if retry.dismissed(&self.policy.work_retry) => {
                     StageState::Scheduling(w, Retry::fresh())
@@ -315,7 +361,7 @@ where
             StageEvent::TeardownOk(Some(cause)) => StageState::Ended(cause),
             StageEvent::TeardownError(w, err, retry, ended) => match err {
                 WorkerError::Retry if !retry.maxed(&self.policy.teardown_retry) => {
-                    StageState::Teardown(w, retry.next(), ended)
+                    StageState::Teardown(w, self.next_retry(retry), ended)
                 }
                 // a teardown that gives up ends the stage; the original cause
                 // wins, falling back to `Errored` for a failed restart
@@ -344,7 +390,8 @@ where
         }
 
         self.state = Some(next_state);
-        self.tick_count.inc(1);
+        self.anchor.framework.ticks.inc(1);
+        self.anchor.framework.phase.set(phase_code(next_phase));
         self.anchor.last_state.store(next_phase);
         self.anchor.last_tick.store(Instant::now());
 
@@ -355,15 +402,21 @@ where
 /// Sentinel object that lives within the thread of the stage
 pub struct Anchor {
     metrics: metrics::Registry,
+    framework: FrameworkMetrics,
     dismissed: tokio_util::sync::CancellationToken,
     last_state: Arc<AtomicCell<StagePhase>>,
     last_tick: AtomicCell<Instant>,
 }
 
 impl Anchor {
-    fn new(metrics: metrics::Registry) -> Self {
+    /// Wrap the stage's registry, adding the framework's entries to it.
+    fn new(mut metrics: metrics::Registry) -> Self {
+        let framework = FrameworkMetrics::default();
+        framework.register(&mut metrics);
+
         Self {
             metrics,
+            framework,
             dismissed: tokio_util::sync::CancellationToken::new(),
             last_tick: AtomicCell::new(Instant::now()),
             last_state: Arc::new(AtomicCell::new(StagePhase::Bootstrap)),
@@ -562,6 +615,8 @@ pub mod tests {
         pub schedule_delay: Option<Duration>,
         pub execute_delay: Option<Duration>,
         pub done_after: Option<usize>,
+        /// after this many units, schedule stays idle instead of producing more
+        pub idle_after: Option<usize>,
     }
 
     impl Stage for MockStage {
@@ -621,6 +676,14 @@ pub mod tests {
                 .is_some_and(|max| self.schedule_count > max)
             {
                 return Ok(WorkSchedule::Done);
+            }
+
+            if stage
+                .idle_after
+                .is_some_and(|max| self.schedule_count > max)
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                return Ok(WorkSchedule::Idle);
             }
 
             Ok(WorkSchedule::Unit(self.schedule_count))
@@ -826,6 +889,166 @@ pub mod tests {
         assert_eq!(
             state,
             TetherState::Finished(StagePhase::Ended(EndCause::Dismissed))
+        );
+    }
+
+    fn read(readings: &Readings, key: &str) -> i128 {
+        match readings.iter().find(|(k, _)| *k == key) {
+            Some((_, metrics::Reading::Count(x))) => *x as i128,
+            Some((_, metrics::Reading::Gauge(x))) => *x as i128,
+            other => panic!("no numeric reading for {key}: {other:?}"),
+        }
+    }
+
+    /// Poll the tether until `key` reaches `target`, returning the readings.
+    fn wait_reading(tether: &Tether, key: &str, target: i128) -> Readings {
+        for _ in 0..500 {
+            let readings = tether.read_metrics().unwrap();
+            if read(&readings, key) >= target {
+                return readings;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        panic!("{key} never reached {target}");
+    }
+
+    #[test]
+    fn framework_metrics_count_units_and_ticks() {
+        let stage = MockStage {
+            idle_after: Some(5),
+            ..Default::default()
+        };
+
+        let tether = super::spawn_stage(stage, Policy::default());
+        let readings = wait_reading(&tether, "gasket_units", 5);
+
+        // the stage idles after five units, so the count stays put
+        std::thread::sleep(Duration::from_millis(50));
+        let readings_later = tether.read_metrics().unwrap();
+        assert_eq!(read(&readings, "gasket_units"), 5);
+        assert_eq!(read(&readings_later, "gasket_units"), 5);
+        assert!(read(&readings_later, "gasket_ticks") > 5);
+        assert_eq!(read(&readings_later, "gasket_retries"), 0);
+        assert_eq!(read(&readings_later, "gasket_phase"), 1);
+
+        tether.dismiss_stage().unwrap();
+        tether.join_stage();
+    }
+
+    #[test]
+    fn framework_metrics_measure_busy_time() {
+        let delay = Duration::from_millis(50);
+
+        let stage = MockStage {
+            execute_delay: Some(delay),
+            idle_after: Some(1),
+            ..Default::default()
+        };
+
+        let tether = super::spawn_stage(stage, Policy::default());
+        let readings = wait_reading(&tether, "gasket_units", 1);
+
+        assert!(read(&readings, "gasket_busy_micros") >= delay.as_micros() as i128);
+
+        tether.dismiss_stage().unwrap();
+        tether.join_stage();
+    }
+
+    #[tokio::test]
+    async fn framework_metrics_count_retries() {
+        let config = MockStage {
+            failures: vec![true],
+            ..Default::default()
+        };
+
+        let anchor = Arc::new(Anchor::new(metrics::Registry::default()));
+
+        let work_retry = super::retries::Policy {
+            max_retries: 3,
+            ..Default::default()
+        };
+
+        let policy = Policy {
+            work_retry,
+            ..Default::default()
+        };
+
+        let mut machine = StageMachine::new(anchor, config, policy, "dummy".into());
+
+        should_bootstrap(&mut machine).await;
+
+        // one schedule, then the first attempt and three retries of the unit
+        for _ in 0..5 {
+            machine.transition().await;
+        }
+
+        let readings = collect_readings(&machine.anchor.metrics);
+        assert_eq!(read(&readings, "gasket_units"), 4);
+        assert_eq!(read(&readings, "gasket_retries"), 3);
+
+        should_teardown_and_end(&mut machine).await;
+    }
+
+    #[tokio::test]
+    async fn framework_metrics_track_phase() {
+        // a slow schedule makes the dismissal below win deterministically
+        let config = MockStage {
+            schedule_delay: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+
+        let anchor = Arc::new(Anchor::new(metrics::Registry::default()));
+        let mut machine = StageMachine::new(anchor, config, Policy::default(), "dummy".into());
+
+        let phase = |machine: &StageMachine<MockStage>| {
+            read(&collect_readings(&machine.anchor.metrics), "gasket_phase")
+        };
+
+        assert_eq!(phase(&machine), 0);
+
+        should_bootstrap(&mut machine).await;
+        assert_eq!(phase(&machine), 1);
+
+        machine.anchor.dismiss_stage().unwrap();
+        machine.transition().await;
+        assert_eq!(phase(&machine), 2);
+
+        should_teardown_and_end(&mut machine).await;
+        assert_eq!(phase(&machine), 3);
+    }
+
+    #[test]
+    fn framework_metrics_sit_beside_stage_metrics() {
+        let own = metrics::Counter::default();
+        own.inc(7);
+
+        let impostor = metrics::Counter::default();
+        impostor.inc(99);
+
+        let mut registry = metrics::Registry::default();
+        registry.track_counter("own", &own);
+        registry.track_counter("gasket_units", &impostor);
+
+        let anchor = Anchor::new(registry);
+        let readings = collect_readings(&anchor.metrics);
+
+        // the stage's entry is untouched, a reserved key is the runtime's
+        assert_eq!(read(&readings, "own"), 7);
+        assert_eq!(read(&readings, "gasket_units"), 0);
+
+        let mut keys: Vec<_> = readings.iter().map(|(k, _)| *k).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "gasket_busy_micros",
+                "gasket_phase",
+                "gasket_retries",
+                "gasket_ticks",
+                "gasket_units",
+                "own"
+            ]
         );
     }
 }

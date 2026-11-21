@@ -20,3 +20,4 @@ syn = "^2"
 
 [dev-dependencies]
 gasket = { path = "../gasket" }
+async-trait = "0.1.68"
