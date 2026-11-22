@@ -86,11 +86,23 @@ fn matches_type(type_path: &syn::TypePath, target_type: &str) -> bool {
         .map_or(false, |segment| segment.ident == target_type)
 }
 
+/// Registry keys with this prefix belong to the runtime's own entries.
+const RESERVED_PREFIX: &str = "gasket_";
+
 fn expand_metric_registration(struct_: &DataStruct) -> syn::Result<Vec<TokenStream>> {
     let metrics_code: syn::Result<Vec<_>> = fields_with_attribute(struct_, "metric")
         .iter()
         .map(|field| {
             let field_name = field.ident.as_ref().unwrap();
+
+            if field_name.to_string().starts_with(RESERVED_PREFIX) {
+                return Err(syn::Error::new_spanned(
+                    field_name,
+                    format!(
+                        "metric names starting with `{RESERVED_PREFIX}` are reserved for the framework"
+                    ),
+                ));
+            }
 
             match &field.ty {
                 syn::Type::Path(x) if matches_type(x, "Counter") => {
@@ -163,9 +175,90 @@ fn expand_stage_impl(input: DeriveInput) -> TokenStream {
     }
 }
 
+/// Implement `gasket::framework::Stage`, registering each `#[metric]` field
+/// under its field name.
+///
+/// ```
+/// # use gasket::framework::*;
+/// # use gasket::metrics::Counter;
+/// #[derive(gasket_derive::Stage)]
+/// #[stage(name = "sample", unit = "()", worker = "SampleWorker")]
+/// struct Sample {
+///     #[metric]
+///     processed: Counter,
+/// }
+/// # struct SampleWorker;
+/// # #[async_trait::async_trait(?Send)]
+/// # impl Worker<Sample> for SampleWorker {
+/// #     async fn bootstrap(_: &Sample) -> Result<Self, WorkerError> { Ok(Self) }
+/// #     async fn schedule(&mut self, _: &mut Sample) -> Result<WorkSchedule<()>, WorkerError> {
+/// #         Ok(WorkSchedule::Done)
+/// #     }
+/// #     async fn execute(&mut self, _: &(), _: &mut Sample) -> Result<(), WorkerError> { Ok(()) }
+/// # }
+/// ```
+///
+/// Names starting with `gasket_` are reserved for the framework's own entries
+/// and refused:
+///
+/// ```compile_fail
+/// # use gasket::framework::*;
+/// # use gasket::metrics::Counter;
+/// #[derive(gasket_derive::Stage)]
+/// #[stage(name = "sample", unit = "()", worker = "SampleWorker")]
+/// struct Sample {
+///     #[metric]
+///     gasket_x: Counter,
+/// }
+/// # struct SampleWorker;
+/// # #[async_trait::async_trait(?Send)]
+/// # impl Worker<Sample> for SampleWorker {
+/// #     async fn bootstrap(_: &Sample) -> Result<Self, WorkerError> { Ok(Self) }
+/// #     async fn schedule(&mut self, _: &mut Sample) -> Result<WorkSchedule<()>, WorkerError> {
+/// #         Ok(WorkSchedule::Done)
+/// #     }
+/// #     async fn execute(&mut self, _: &(), _: &mut Sample) -> Result<(), WorkerError> { Ok(()) }
+/// # }
+/// ```
 #[proc_macro_derive(Stage, attributes(stage, metric))]
 pub fn stage_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let expanded = expand_stage_impl(input);
     proc_macro::TokenStream::from(expanded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expand(source: &str) -> String {
+        expand_stage_impl(syn::parse_str(source).unwrap()).to_string()
+    }
+
+    #[test]
+    fn refuses_reserved_metric_names() {
+        let out = expand(
+            r#"
+            #[stage(name = "x", unit = "()", worker = "W")]
+            struct X { #[metric] gasket_x: Counter }
+            "#,
+        );
+
+        assert!(out.contains("compile_error"));
+        assert!(out.contains("reserved for the framework"));
+    }
+
+    #[test]
+    fn registers_other_metric_names() {
+        let out = expand(
+            r#"
+            #[stage(name = "x", unit = "()", worker = "W")]
+            struct X { #[metric] processed: Counter, #[metric] gasketx: Gauge }
+            "#,
+        );
+
+        assert!(!out.contains("compile_error"));
+        assert!(out.contains("track_counter"));
+        assert!(out.contains("track_gauge"));
+    }
 }

@@ -1,3 +1,21 @@
+//! Stage metrics: counters and gauges a stage exposes through its registry.
+//!
+//! Besides the entries a stage declares, the runtime adds its own to every
+//! stage's registry, under keys reserved by the `gasket_` prefix:
+//!
+//! - `gasket_ticks` (counter): state-machine ticks;
+//! - `gasket_units` (counter): work units whose `execute` returned, with
+//!   success or error;
+//! - `gasket_busy_micros` (counter): time spent inside `execute`, in
+//!   microseconds;
+//! - `gasket_retries` (counter): retries taken in any phase (bootstrap,
+//!   schedule, execute, teardown);
+//! - `gasket_phase` (gauge): the current phase, 0 bootstrap, 1 working,
+//!   2 teardown, 3 ended.
+//!
+//! The derive macro refuses `#[metric]` fields named with the reserved
+//! prefix; in a hand-built registry, the runtime's entry replaces any such key.
+
 use crossbeam::atomic::AtomicCell;
 use std::{collections::HashMap, sync::Arc};
 
@@ -27,6 +45,11 @@ impl Registry {
             Metric::Gauge(x) => x.clone(),
             _ => unreachable!(),
         }
+    }
+
+    /// Insert `metric` under `key`, replacing any entry already there.
+    pub(crate) fn insert(&mut self, key: &'static str, metric: Metric) {
+        self.0.insert(key, metric);
     }
 
     pub fn entries(&self) -> std::collections::hash_map::Iter<'_, &str, Metric> {
