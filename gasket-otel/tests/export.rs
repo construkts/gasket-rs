@@ -386,7 +386,7 @@ fn one_instrument_for_a_key_shared_by_two_stages() {
 #[test]
 fn exports_a_key_only_one_stage_declares() {
     let daemon = daemon(vec![
-        TestStage::new("alpha", 2),
+        TestStage::new("alpha", 2).with_own_key("read"),
         TestStage::new("beta", 3).with_own_key("written"),
     ]);
     wait_processed_each(&daemon, &[("alpha", 2), ("beta", 3)]);
@@ -397,6 +397,10 @@ fn exports_a_key_only_one_stage_declares() {
 
     let collected = harness.collect();
 
+    assert_eq!(
+        per_stage(&collected, "app.read"),
+        vec![("alpha".into(), 2.0)]
+    );
     assert_eq!(
         per_stage(&collected, "app.written"),
         vec![("beta".into(), 3.0)]

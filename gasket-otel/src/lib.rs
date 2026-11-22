@@ -82,8 +82,9 @@ pub struct Instruments {
 }
 
 impl Instruments {
-    /// Stop the export and hand back the daemon. A collection in progress
-    /// finishes first, so the bridge holds no reference once this returns.
+    /// Stop the export and hand back the daemon. A callback reading the
+    /// daemon finishes first, so the bridge holds no reference once this
+    /// returns; a collection in progress may export only some instruments.
     pub fn release(self) -> Arc<Daemon> {
         take(&self.source).expect("the daemon is held until released")
     }
