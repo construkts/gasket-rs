@@ -2,11 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-11-22
+
+### 🚀 Features
+
+- Report framework metrics for every stage (#39)
+- Add gasket-otel, an OpenTelemetry bridge for stage metrics (#40)
+
 ## [0.11.1] - 2026-06-14
 
 ### 🚀 Features
 
 - Drop prometheus_exporter_base for a lightweight metrics endpoint (#37) (#38)
+
+### 💼 Other
+
+- V0.11.1
 
 ## [0.11.0] - 2026-06-13
 
