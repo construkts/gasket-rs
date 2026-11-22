@@ -17,10 +17,20 @@ use opentelemetry::global;
 let daemon = Arc::new(gasket::daemon::Daemon::new(tethers));
 
 let meter = global::meter("my-app");
-let _instruments = gasket_otel::register(&meter, "my_app", Arc::clone(&daemon));
+let instruments = gasket_otel::register(&meter, "my_app", daemon);
+
+// ... run until the daemon should stop ...
+
+// stop the export and take the daemon back to tear it down
+let daemon = Arc::try_unwrap(instruments.release()).expect("no other owner");
+daemon.teardown();
 ```
 
-Keep the returned `Instruments` for as long as the metrics should be exported.
+The returned `Instruments` owns the daemon and exports while it lives. Its
+callbacks stay registered with the meter provider, but once `Instruments` is
+dropped or released they observe nothing and hold no reference to the daemon,
+so the daemon can be torn down while the provider keeps running.
+
 Instruments are created for the metric keys of the stages that are alive when
 `register` is called.
 

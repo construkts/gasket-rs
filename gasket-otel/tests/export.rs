@@ -20,12 +20,15 @@ use opentelemetry_sdk::metrics::{
 
 /// A stage that executes `units` work units, counting them and setting a
 /// gauge to the last one, then idles until dismissed or until `finish` is set.
+/// With an `own` key it also counts its units under that key.
 struct TestStage {
     name: &'static str,
     units: u64,
     finish: Arc<AtomicBool>,
+    own: Option<&'static str>,
     processed: Counter,
     level: Gauge,
+    owned: Counter,
 }
 
 impl TestStage {
@@ -34,9 +37,16 @@ impl TestStage {
             name,
             units,
             finish: Default::default(),
+            own: None,
             processed: Default::default(),
             level: Default::default(),
+            owned: Default::default(),
         }
+    }
+
+    fn with_own_key(mut self, key: &'static str) -> Self {
+        self.own = Some(key);
+        self
     }
 
     fn finish_on(mut self, flag: &Arc<AtomicBool>) -> Self {
@@ -54,10 +64,14 @@ impl Stage for TestStage {
     }
 
     fn metrics(&self) -> metrics::Registry {
-        metrics::Builder::default()
+        let builder = metrics::Builder::default()
             .with_counter("processed", &self.processed)
-            .with_gauge("level", &self.level)
-            .build()
+            .with_gauge("level", &self.level);
+
+        match self.own {
+            Some(key) => builder.with_counter(key, &self.owned).build(),
+            None => builder.build(),
+        }
     }
 }
 
@@ -86,6 +100,7 @@ impl Worker<TestStage> for TestWorker {
     async fn execute(&mut self, unit: &u64, stage: &mut TestStage) -> Result<(), WorkerError> {
         tokio::time::sleep(Duration::from_millis(2)).await;
         stage.processed.inc(1);
+        stage.owned.inc(1);
         stage.level.set(*unit as i64 * 10);
         Ok(())
     }
@@ -100,11 +115,27 @@ fn daemon(stages: Vec<TestStage>) -> Arc<Daemon> {
     Arc::new(Daemon::new(tethers))
 }
 
-/// Stop every stage; the meter's callbacks still share the daemon.
-fn dismiss(daemon: &Daemon) {
-    for tether in daemon.tethers() {
-        let _ = tether.dismiss_stage();
+/// Release the daemon from the bridge and tear it down; `daemon` is the
+/// test's own handle, dropped first so the bridge's is the last one.
+fn shutdown(instruments: gasket_otel::Instruments, daemon: Arc<Daemon>) {
+    drop(daemon);
+
+    let daemon = Arc::try_unwrap(instruments.release()).expect("the bridge is the last owner");
+    daemon.teardown();
+}
+
+/// Wait until `tether` has dropped, as a stage that ended does.
+fn wait_dropped(daemon: &Daemon, name: &str) {
+    let tether = daemon.tethers().find(|t| t.name() == name).unwrap();
+
+    for _ in 0..500 {
+        if tether.read_metrics().is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
+
+    panic!("{name}'s tether should drop");
 }
 
 /// Wait until every stage that is still readable reports `processed == units`.
@@ -143,13 +174,15 @@ impl Harness {
     }
 
     fn collect(&self) -> ResourceMetrics {
+        self.try_collect().expect("a collection")
+    }
+
+    /// The collection, if the provider exported one; it exports nothing when
+    /// no instrument observed a value.
+    fn try_collect(&self) -> Option<ResourceMetrics> {
         self.exporter.reset();
         self.provider.force_flush().unwrap();
-        self.exporter
-            .get_finished_metrics()
-            .unwrap()
-            .pop()
-            .expect("a collection")
+        self.exporter.get_finished_metrics().unwrap().pop()
     }
 }
 
@@ -228,8 +261,7 @@ fn exports_stage_counter_and_gauge_per_stage() {
         AggregatedMetrics::I64(MetricData::Gauge(_))
     ));
 
-    drop(instruments);
-    dismiss(&daemon);
+    shutdown(instruments, daemon);
 }
 
 #[test]
@@ -239,7 +271,7 @@ fn exports_framework_series_without_prefix_and_with_units() {
 
     let harness = Harness::new();
     let meter = harness.provider.meter("test");
-    let _instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
+    let instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
 
     let collected = harness.collect();
 
@@ -286,7 +318,7 @@ fn exports_framework_series_without_prefix_and_with_units() {
         );
     }
 
-    dismiss(&daemon);
+    shutdown(instruments, daemon);
 }
 
 #[test]
@@ -300,7 +332,7 @@ fn skips_a_stage_whose_tether_dropped() {
 
     let harness = Harness::new();
     let meter = harness.provider.meter("test");
-    let _instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
+    let instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
 
     let before = harness.collect();
     assert_eq!(
@@ -309,15 +341,7 @@ fn skips_a_stage_whose_tether_dropped() {
     );
 
     finish.store(true, Ordering::Relaxed);
-
-    let alpha = daemon.tethers().find(|t| t.name() == "alpha").unwrap();
-    for _ in 0..500 {
-        if alpha.read_metrics().is_err() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(alpha.read_metrics().is_err(), "alpha's tether should drop");
+    wait_dropped(&daemon, "alpha");
 
     let collected = harness.collect();
 
@@ -327,7 +351,7 @@ fn skips_a_stage_whose_tether_dropped() {
     );
     assert_eq!(stages(&per_stage(&collected, "app.phase")), vec!["beta"]);
 
-    dismiss(&daemon);
+    shutdown(instruments, daemon);
 }
 
 #[test]
@@ -356,7 +380,116 @@ fn one_instrument_for_a_key_shared_by_two_stages() {
         vec![("alpha".into(), 1.0), ("beta".into(), 2.0)]
     );
 
-    dismiss(&daemon);
+    shutdown(instruments, daemon);
+}
+
+#[test]
+fn exports_a_key_only_one_stage_declares() {
+    let daemon = daemon(vec![
+        TestStage::new("alpha", 2),
+        TestStage::new("beta", 3).with_own_key("written"),
+    ]);
+    wait_processed_each(&daemon, &[("alpha", 2), ("beta", 3)]);
+
+    let harness = Harness::new();
+    let meter = harness.provider.meter("test");
+    let instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
+
+    let collected = harness.collect();
+
+    assert_eq!(
+        per_stage(&collected, "app.written"),
+        vec![("beta".into(), 3.0)]
+    );
+    assert_eq!(
+        stages(&per_stage(&collected, "app.processed")),
+        vec!["alpha", "beta"]
+    );
+
+    shutdown(instruments, daemon);
+}
+
+#[test]
+fn registers_after_a_stage_ended() {
+    let finish = Arc::new(AtomicBool::new(true));
+    let daemon = daemon(vec![
+        TestStage::new("alpha", 1).finish_on(&finish),
+        TestStage::new("beta", 2),
+    ]);
+    wait_dropped(&daemon, "alpha");
+    wait_processed_each(&daemon, &[("beta", 2)]);
+
+    let harness = Harness::new();
+    let meter = harness.provider.meter("test");
+    let instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
+
+    let collected = harness.collect();
+
+    assert_eq!(
+        per_stage(&collected, "app.processed"),
+        vec![("beta".into(), 2.0)]
+    );
+    assert_eq!(stages(&per_stage(&collected, "app.phase")), vec!["beta"]);
+
+    shutdown(instruments, daemon);
+}
+
+#[test]
+fn dropping_the_instruments_frees_the_daemon() {
+    let daemon = daemon(vec![TestStage::new("alpha", 1), TestStage::new("beta", 1)]);
+    wait_processed(&daemon, 1);
+
+    // the provider and its callbacks outlive the instruments
+    let harness = Harness::new();
+    let meter = harness.provider.meter("test");
+    let instruments = gasket_otel::register(&meter, "app", Arc::clone(&daemon));
+
+    assert_eq!(
+        stages(&per_stage(&harness.collect(), "app.level")),
+        vec!["alpha", "beta"]
+    );
+
+    drop(instruments);
+
+    assert!(observed(harness.try_collect(), "app.level").is_empty());
+
+    let daemon = Arc::try_unwrap(daemon).expect("the bridge let go of the daemon");
+    daemon.teardown();
+
+    assert!(observed(harness.try_collect(), "app.level").is_empty());
+}
+
+#[test]
+fn release_hands_back_the_daemon_for_teardown() {
+    let daemon = daemon(vec![TestStage::new("alpha", 1), TestStage::new("beta", 1)]);
+    wait_processed(&daemon, 1);
+
+    let harness = Harness::new();
+    let meter = harness.provider.meter("test");
+
+    // the bridge takes the only handle
+    let instruments = gasket_otel::register(&meter, "app", daemon);
+
+    assert_eq!(
+        stages(&per_stage(&harness.collect(), "app.processed")),
+        vec!["alpha", "beta"]
+    );
+
+    let daemon = Arc::try_unwrap(instruments.release()).expect("the bridge holds no other handle");
+    assert!(observed(harness.try_collect(), "app.processed").is_empty());
+
+    daemon.teardown();
+}
+
+/// The stages a metric was observed for, empty when it wasn't collected.
+fn observed(collected: Option<ResourceMetrics>, name: &str) -> Vec<String> {
+    match collected {
+        Some(collected) if metric(&collected, name).is_some() => per_stage(&collected, name)
+            .into_iter()
+            .map(|(stage, _)| stage)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn wait_processed_each(daemon: &Daemon, expected: &[(&str, u64)]) {

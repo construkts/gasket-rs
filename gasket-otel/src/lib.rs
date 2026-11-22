@@ -4,7 +4,10 @@
 //! installs observable instruments whose callbacks read every stage at
 //! collection time. Nothing is recorded on the stages' hot path.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use gasket::{
     daemon::Daemon,
@@ -63,17 +66,28 @@ const BUSY: FrameworkEntry = FrameworkEntry {
 
 const FRAMEWORK: [&FrameworkEntry; 5] = [&TICKS, &UNITS, &RETRIES, &PHASE, &BUSY];
 
-/// Keeps the instruments [`register`] created. Hold it for as long as the
-/// metrics should be exported; the callbacks themselves belong to the meter
-/// provider and stop with it.
-#[must_use = "the instruments are meant to live as long as the export"]
+/// The daemon the callbacks read, until [`Instruments`] lets go of it.
+type Source = Arc<RwLock<Option<Arc<Daemon>>>>;
+
+/// Owns the daemon that [`register`] exports. Values are observed while it
+/// lives; once it is dropped or [`Instruments::release`]d, the callbacks,
+/// which stay registered with the meter provider, observe nothing and hold
+/// no reference to the daemon, so it can be torn down.
+#[must_use = "dropping the instruments stops the export"]
 pub struct Instruments {
+    source: Source,
     counters: Vec<ObservableCounter<u64>>,
     seconds: Vec<ObservableCounter<f64>>,
     gauges: Vec<ObservableGauge<i64>>,
 }
 
 impl Instruments {
+    /// Stop the export and hand back the daemon. A collection in progress
+    /// finishes first, so the bridge holds no reference once this returns.
+    pub fn release(self) -> Arc<Daemon> {
+        take(&self.source).expect("the daemon is held until released")
+    }
+
     /// How many instruments were registered.
     pub fn len(&self) -> usize {
         self.counters.len() + self.seconds.len() + self.gauges.len()
@@ -82,6 +96,19 @@ impl Instruments {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+impl Drop for Instruments {
+    fn drop(&mut self) {
+        take(&self.source);
+    }
+}
+
+fn take(source: &Source) -> Option<Arc<Daemon>> {
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,16 +121,20 @@ enum Kind {
 /// daemon's stages, named `<namespace>.<key>` and observed once per stage
 /// with the `stage` attribute. Framework entries drop their `gasket_` prefix
 /// and carry units; `gasket_busy_micros` becomes `<namespace>.busy_time` in
-/// seconds. Keys are discovered from the stages that are alive now.
+/// seconds. Keys are discovered from the stages that are alive now. The
+/// returned [`Instruments`] owns the daemon for as long as it exports.
 pub fn register(meter: &Meter, namespace: &str, daemon: Arc<Daemon>) -> Instruments {
+    let keys = discover_keys(&daemon);
+
     let mut instruments = Instruments {
+        source: Arc::new(RwLock::new(Some(daemon))),
         counters: Vec::new(),
         seconds: Vec::new(),
         gauges: Vec::new(),
     };
 
-    for (key, kind) in discover_keys(&daemon) {
-        let source = Arc::clone(&daemon);
+    for (key, kind) in keys {
+        let source = Arc::clone(&instruments.source);
 
         match (framework_entry(key), kind) {
             (Some(entry), _) if entry.key == BUSY.key => {
@@ -207,13 +238,20 @@ fn discover_keys(daemon: &Daemon) -> BTreeMap<&'static str, Kind> {
 }
 
 /// Observe `key` once per stage that holds it with the instrument's kind.
-/// Stages whose tether has dropped are skipped.
+/// Stages whose tether has dropped are skipped, and nothing is observed once
+/// the daemon was released.
 fn observe<T>(
-    daemon: &Daemon,
+    source: &Source,
     key: &str,
     observer: &dyn AsyncInstrument<T>,
     value: impl Fn(&Reading) -> Option<T>,
 ) {
+    let guard = source.read().unwrap_or_else(PoisonError::into_inner);
+
+    let Some(daemon) = guard.as_ref() else {
+        return;
+    };
+
     for tether in daemon.tethers() {
         let Ok(readings) = tether.read_metrics() else {
             continue;
