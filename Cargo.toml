@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["gasket", "gasket-derive", "gasket-prometheus"]
+members = ["gasket", "gasket-derive", "gasket-prometheus", "gasket-otel"]
 
 [workspace.dev-dependencies]
 git-cliff = "1.82.0"
